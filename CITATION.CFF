@@ -1,0 +1,8 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "S.D.A.T. - SIP Data Analysis Tool"
+authors:
+  - name: "Stratos Kokolakis"
+doi: "10.5281/zenodo.18652597"
+url: "https://doi.org/10.5281/zenodo.18652597"
+date-released: "2026-02-15"
