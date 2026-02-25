@@ -307,7 +307,7 @@ def parse_oe_psip_format(lines: list) -> Tuple[Optional[pd.DataFrame], Optional[
 
 
 # ============================================================================
-# UNIFIED PARSER WITH AUTO-DETECTION
+# UNIFIED PARSER
 # ============================================================================
 
 def validate_dataframe(df: pd.DataFrame) -> bool:
@@ -403,8 +403,26 @@ def calculate_physics_properties(
     sample_length: float,
     sample_area: float
 ) -> pd.DataFrame:
-    """Calculate resistance, resistivity, and conductivity for all channels."""
+    """Calculate resistance, resistivity, and conductivity for all channels.
     
+    Uses formulas according the Excel worksheet:
+    - Resistance = Magnitude × Reference Resistor
+    - Resistivity = (Resistance × Area) / Length
+    - Fluid Conductivity = (1 / Resistivity) × 10000 (μS/cm)
+    - Real Conductivity = (1 / Resistivity) × cos(Phase) (S/m)
+    - Imaginary Conductivity = -(1 / Resistivity) × sin(Phase) (S/m)
+    - Cell Constant K = 1,000,000 × 0.1606 / Resistance
+    - Phase in milliradians = -Phase × 1000
+    
+    Args:
+        sip_data: DataFrame with raw SIP data
+        reference_resistor: Reference resistor value in Ohms
+        sample_length: Sample length in meters
+        sample_area: Sample cross-sectional area in square meters
+        
+    Returns:
+        DataFrame with calculated properties added
+    """
     # Find all Magnitude columns to calculate physics for each channel
     magnitude_columns = [c for c in sip_data.columns if 'Magnitude[ratio]' in c]
     
@@ -416,28 +434,68 @@ def calculate_physics_properties(
     
     logger.info(f"Calculating physics properties for {len(magnitude_columns)} channels")
     
+    # Cell constant factor (geometric factor for the measurement cell)
+    CELL_CONSTANT_FACTOR = 0.1606
+    
     for mag_col in magnitude_columns:
         # Extract prefix (e.g., "Chan-1")
         prefix = mag_col.replace(' Magnitude[ratio]', '')
         
-        # Calculate Z (Resistance)
-        z_col = f"{prefix} Resistance (Ohms)"
-        sip_data[z_col] = sip_data[mag_col] * reference_resistor
+        # Find corresponding Phase column
+        phase_col = f"{prefix} Phase_Shift[rad]"
+        has_phase = phase_col in sip_data.columns
         
-        # Calculate Resistivity (Rho)
-        rho_col = f"{prefix} Resistivity (Ohm-m)"
-        sip_data[rho_col] = sip_data[z_col] * (sample_area / sample_length)
+        # D: Resistance (Ω) = Magnitude × Reference Resistor
+        resistance_col = f"{prefix} Resistance (Ohms)"
+        sip_data[resistance_col] = sip_data[mag_col] * reference_resistor
         
-        # Calculate Conductivity (Sigma)
-        cond_col = f"{prefix} Conductivity (mS/m)"
-        sip_data[cond_col] = np.where(
-            sip_data[rho_col] > MIN_RESISTIVITY_THRESHOLD,
-            1000 / sip_data[rho_col],  # Convert to mS/m
+        # E: Resistivity (Ω·m) = (Resistance × Area) / Length
+        resistivity_col = f"{prefix} Resistivity (Ohm-m)"
+        sip_data[resistivity_col] = (sip_data[resistance_col] * sample_area) / sample_length
+        
+        # F: Fluid Conductivity (μS/cm) = (1 / Resistivity) × 10000
+        fluid_cond_col = f"{prefix} Fluid Conductivity (uS/cm)"
+        sip_data[fluid_cond_col] = np.where(
+            sip_data[resistivity_col] > MIN_RESISTIVITY_THRESHOLD,
+            (1 / sip_data[resistivity_col]) * 10000,
             np.nan
         )
+        
+        # J: Cell Constant K = 1,000,000 × 0.1606 / Resistance
+        k_col = f"{prefix} Cell Constant K"
+        sip_data[k_col] = np.where(
+            sip_data[resistance_col] > 1e-10,
+            1000000 * CELL_CONSTANT_FACTOR / sip_data[resistance_col],
+            np.nan
+        )
+        
+        # Phase-dependent calculations (only if phase data available)
+        if has_phase:
+            # G: Phase in milliradians = -Phase × 1000
+            phase_mrad_col = f"{prefix} Phase (mRads)"
+            sip_data[phase_mrad_col] = -sip_data[phase_col] * 1000
+            
+            # H: Imaginary Conductivity (S/m) = -(1 / Resistivity) × sin(Phase)
+            imag_cond_col = f"{prefix} Imaginary Conductivity (S/m)"
+            sip_data[imag_cond_col] = np.where(
+                sip_data[resistivity_col] > MIN_RESISTIVITY_THRESHOLD,
+                -(1 / sip_data[resistivity_col]) * np.sin(sip_data[phase_col]),
+                np.nan
+            )
+            
+            # I: Real Conductivity (S/m) = (1 / Resistivity) × cos(Phase)
+            real_cond_col = f"{prefix} Real Conductivity (S/m)"
+            sip_data[real_cond_col] = np.where(
+                sip_data[resistivity_col] > MIN_RESISTIVITY_THRESHOLD,
+                (1 / sip_data[resistivity_col]) * np.cos(sip_data[phase_col]),
+                np.nan
+            )
+            
+            # K: Imaginary Conductivity in μS/cm = Imaginary Conductivity × 10000
+            imag_cond_uscm_col = f"{prefix} Imaginary Conductivity (uS/cm)"
+            sip_data[imag_cond_uscm_col] = sip_data[imag_cond_col] * 10000
     
     return sip_data
-
 
 # ============================================================================
 # MAIN APPLICATION
