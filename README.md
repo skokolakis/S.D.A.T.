@@ -19,12 +19,6 @@ SIP Data Analyzer transforms tedious manual Excel workflows into a seamless, aut
 - **Simple Table Format**: Basic frequency/magnitude/phase data files
 - Automatic detection - no manual format selection needed
 
-### Comprehensive Physics Calculations
-- **Resistance** (Ω): Z = Magnitude × Reference Resistor
-- **Resistivity** (Ω·m): ρ = Z × (Area / Length)
-- **Conductivity** (mS/m): σ = 1000 / ρ
-- Vectorized operations for fast computation
-
 ### Interactive Visualization
 - Multi-channel plotting with customizable axes
 - Loop filtering and comparison
