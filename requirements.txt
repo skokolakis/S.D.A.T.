@@ -4,4 +4,3 @@ plotly
 numpy
 scipy
 kaleido
-chrome
