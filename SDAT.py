@@ -17,6 +17,8 @@ import logging
 import re
 from typing import Tuple, Optional, Dict, List
 from enum import Enum
+from scipy import stats, signal, optimize
+from scipy.interpolate import UnivariateSpline
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -1563,6 +1565,54 @@ def get_plot_style_customization_with_defaults(key_prefix="", defaults=None):
         'marker_size': marker_size
     }
 
+# ============================================================================
+# STATISTICAL ANALYSIS FUNCTIONS
+# ============================================================================
+def descriptive_stats(self, columns: List[str]) -> pd.DataFrame:
+        """Calculate basic statistics, using geometric stats for logarithmic data."""
+        stats_dict = {}
+        for col in columns:
+            if col in self.data.columns:
+                # Clean the data: drop NaNs and infinite values which break calculations
+                values = self.data[col].replace([np.inf, -np.inf], np.nan).dropna()
+                
+                if len(values) == 0:
+                    continue
+                
+                is_phase = 'phase' in col.lower()
+                is_strictly_positive = (values > 0).all()
+                
+                # If it's Magnitude, Resistance, or Resistivity (strictly positive)
+                if is_strictly_positive and not is_phase:
+                    log_vals = np.log10(values)
+                    stats_dict[col] = {
+                        'Count': len(values),
+                        'Type': 'Logarithmic',
+                        'Mean (Geom)': 10**(log_vals.mean()),
+                        'Std Dev (Geom Factor)': 10**(log_vals.std()),
+                        'Min': values.min(),
+                        'Max': values.max(),
+                        'Q1': values.quantile(0.25),
+                        'Median': values.median(),
+                        'Q3': values.quantile(0.75),
+                    }
+                else:
+                    # Linear stats for Phase or data with negatives/zeroes
+                    stats_dict[col] = {
+                        'Count': len(values),
+                        'Type': 'Linear',
+                        'Mean (Arith)': values.mean(),
+                        'Std Dev (Arith)': values.std(),
+                        'Min': values.min(),
+                        'Max': values.max(),
+                        'Q1': values.quantile(0.25),
+                        'Median': values.median(),
+                        'Q3': values.quantile(0.75),
+                    }
+        
+        # Fill missing keys with NaN so the dataframe columns align perfectly
+        return pd.DataFrame(stats_dict).T
+    
 
 # ============================================================================
 # MAIN APPLICATION
@@ -1717,7 +1767,7 @@ def main():
             # Apply style customizations with fonts and legend
             fig = apply_style_to_figure(fig, style_config, line_colors, font_config, legend_config)
             
-            st.plotly_chart(fig, use_container_width=True, config=get_plot_config())
+            st.plotly_chart(fig, use_container_width=True, config=get_plot_config(), theme=None)
             
             # Add export UI in sidebar
             with col1:
@@ -1731,7 +1781,6 @@ def main():
             file_name=f"sip_processed_{file_key}",
             mime="text/csv"
         )
- 
     else:
         # ── Multi-file comparison mode ──
         st.subheader(f"Comparing {len(processed_datasets)} files")
