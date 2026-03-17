@@ -1569,7 +1569,7 @@ def get_plot_style_customization_with_defaults(key_prefix="", defaults=None):
 # ============================================================================
 
 def main():
-    st.title("SIP Data Analysis App")
+    st.title("SIP Data Analysis Tool")
  
     if 'datasets' not in st.session_state:
         st.session_state.datasets = {}
