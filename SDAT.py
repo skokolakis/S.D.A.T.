@@ -1590,20 +1590,24 @@ def main():
         with st.expander("About this app"):
             st.markdown("""
             **Features:**
-            - Automatic parsing of multiple file formats
-            - Physics calculations (Resistance, Resistivity, Conductivity)
-            - Interactive multi-channel visualization
-            - **Multi-file comparison** with overlay and subplot views
-            - Support for multiple measurement loops
-            - Customizable dual-axis plots
- 
-            **Supported File Formats:**
-            - O&E PSIP (.csv) - Full instrument output
-            - Simple Tables (.txt, .csv) - Frequency/Magnitude/Phase data
- 
-            **Comparison Mode:**
-            Upload multiple files to compare measurements across different samples,
-            conditions, or time points. View data overlaid or in separate subplots.
+            ### Intelligent Format Detection
+            - **O&E PSIP Format**: Full instrument output with metadata, multi-channel support
+            - **Simple Table Format**: Basic frequency/magnitude/phase data files
+            - Automatic detection - no manual format selection needed
+            
+            ### Interactive Visualization
+            - Multi-channel plotting with customizable axes
+            - Loop filtering and comparison
+            - Dual Y-axis support for comparing different parameters
+            - Logarithmic scaling options
+            - Hover tooltips for precise value inspection
+            
+            ### Robust Data Handling
+            - Handles files with multiple header sections
+            - European decimal format support (comma to dot conversion)
+            - Flexible separator detection (tabs, spaces)
+            - Empty column handling
+            - Automatic data type conversion
             """)
         return
  
