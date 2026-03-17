@@ -2,6 +2,8 @@
 
 A powerful web-based tool for automated analysis of Spectral Induced Polarization (SIP) measurement data. Features automatic format detection, multi-channel support, and interactive visualization.
 
+The tool can be also be used online via **https://sdatsite.streamlit.app**
+
 ## Overview
 
 SIP Data Analyzer transforms tedious manual Excel workflows into a seamless, automated analysis pipeline. Upload your SIP measurement files and instantly get:
