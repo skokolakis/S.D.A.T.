@@ -1718,9 +1718,25 @@ def main():
             custom_y_label = st.text_input("Y-Axis Label", value=y_axis)
             st.markdown("---")
             if 'Loop' in sip_data.columns:
-                loops = sorted(sip_data['Loop'].unique())
-                selected_loops = st.multiselect("Select Loops", loops, default=loops)
-                plot_data = sip_data[sip_data['Loop'].isin(selected_loops)] if len(selected_loops) < len(loops) else sip_data
+                all_loops = sip_data['Loop'].unique()
+                # Filter out "Loop" string and empty values to show only loop identifiers
+                valid_loops = [
+                    loop for loop in all_loops 
+                    if str(loop).strip() and str(loop).strip().lower() != 'loop'
+                ]
+                
+                if valid_loops:
+                    selected_loops = st.multiselect(
+                        "Select Loops", 
+                        valid_loops, 
+                        default=valid_loops,
+                        help="Choose which measurement loops to display"
+                    )
+                    plot_data = sip_data[sip_data['Loop'].isin(selected_loops)] if selected_loops else sip_data
+                else:
+                    # No valid loop identifiers found, use all data
+                    plot_data = sip_data
+                    st.info("No loop identifiers found. Displaying all measurement data.")
             else:
                 plot_data = sip_data
             log_x = st.checkbox("Log Scale X-Axis", value=True)
