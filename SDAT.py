@@ -34,6 +34,10 @@ HEADER_MARKER = '***End_Of_Header***'
 RESISTOR_KEY = 'Current Resistor[Ohms]'
 MIN_RESISTIVITY_THRESHOLD = 1e-6  # Ohm-m, minimum value to avoid division issues
 CELL_CONSTANT_FACTOR = 0.1606  # Geometric factor for cell constant calculation
+# Magnitude columns, e.g. "Chan-1 Magnitude[ratio]", "Magnitude[dB]" or a bare "Magnitude"
+MAGNITUDE_COL_PATTERN = re.compile(r'Magnitude(?:\s*\[(ratio|dB)\])?\s*$', re.IGNORECASE)
+# PSIP writer version 2 files store magnitude in dB
+WRITER_VERSION_PATTERN = re.compile(r'^\s*Writer_Version\s*[,\t]\s*2\b', re.IGNORECASE | re.MULTILINE)
 
 # ============================================================================
 #STREAMLIT PAGE CONFIGURATION
@@ -60,8 +64,10 @@ class FileFormat(Enum):
 def detect_file_format(lines: list) -> FileFormat:
     """Detect the format of the uploaded file."""
     header_content = '\n'.join(lines[:min(20, len(lines))])
-    
-    if HEADER_MARKER in header_content or 'OE PSIP Measurement' in header_content:
+
+    if (HEADER_MARKER.lower() in header_content.lower()
+            or 'OE PSIP Measurement' in header_content
+            or WRITER_VERSION_PATTERN.search(header_content)):
         logger.info("Detected format: OE PSIP")
         return FileFormat.OE_PSIP
     
@@ -72,51 +78,6 @@ def detect_file_format(lines: list) -> FileFormat:
     logger.warning("Unknown file format")
     return FileFormat.UNKNOWN
 
-
-def find_header_end(lines: list) -> int:
-    """Find the index of the LAST header end marker in the file."""
-    last_marker_idx = -1
-    for i, line in enumerate(lines):
-        if HEADER_MARKER in line:
-            last_marker_idx = i
-    return last_marker_idx
-
-
-def extract_resistor_value(lines: list) -> Tuple[float, bool]:
-    """Extract reference resistor value from file metadata."""
-    for line in lines:
-        if RESISTOR_KEY in line:
-            try:
-                value = float(line.split(',')[1])
-                logger.info(f"Found reference resistor: {value} Ohms")
-                return value, True
-            except (IndexError, ValueError) as e:
-                logger.warning(f"Failed to parse resistor value: {e}")
-    
-    logger.warning(f"Resistor value not found, using default: {DEFAULT_REF_RESISTOR} Ohms")
-    return DEFAULT_REF_RESISTOR, False
-
-
-def build_column_headers(channel_line: str, column_line: str) -> list:
-    """Build combined column headers from channel and column name lines."""
-    channel_tokens = channel_line.strip().split(',')
-    col_tokens = column_line.strip().split(',')
-    
-    max_len = max(len(channel_tokens), len(col_tokens))
-    channel_tokens += [''] * (max_len - len(channel_tokens))
-    col_tokens += [''] * (max_len - len(col_tokens))
-    
-    unique_columns = []
-    for ch, col in zip(channel_tokens, col_tokens):
-        col = col.strip()
-        ch = ch.strip()
-        if ch:
-            unique_columns.append(f"{ch} {col}")
-        else:
-            unique_columns.append(col)
-    
-    unique_columns = [c for c in unique_columns if c]
-    return unique_columns
 
 # ============================================================================
 # SIMPLE TABLE PARSER
@@ -187,6 +148,8 @@ def parse_simple_table(lines: list) -> Tuple[Optional[pd.DataFrame], Optional[fl
             column_mapping[col] = 'Frequency[Hz]'
         elif 'mag' in col_lower and 'ratio' in col_lower:
             column_mapping[col] = 'Chan-1 Magnitude[ratio]'
+        elif 'mag' in col_lower and 'db' in col_lower:
+            column_mapping[col] = 'Chan-1 Magnitude[dB]'
         elif 'phase' in col_lower and 'rad' in col_lower:
             column_mapping[col] = 'Chan-1 Phase_Shift[rad]'
     
@@ -206,11 +169,47 @@ def parse_simple_table(lines: list) -> Tuple[Optional[pd.DataFrame], Optional[fl
 # ============================================================================
 
 def find_header_end(lines: list) -> int:
+    """Find the index of the LAST header end marker (case-insensitive, since
+    LabVIEW writers emit both '***End_Of_Header***' and '***End_of_Header***')."""
+    marker = HEADER_MARKER.lower()
     last_marker_idx = -1
     for i, line in enumerate(lines):
-        if HEADER_MARKER in line:
+        if marker in line.lower():
             last_marker_idx = i
     return last_marker_idx
+
+
+def detect_magnitude_unit(lines: list, columns: list) -> str:
+    """Detect whether the magnitude columns hold a linear ratio or dB.
+
+    The column unit (e.g. 'Magnitude[dB]' vs 'Magnitude[ratio]') takes precedence.
+    Otherwise PSIP files written with 'Writer_Version,2' store magnitude in dB.
+
+    Returns:
+        'dB' or 'ratio'
+    """
+    units = set()
+    for col in columns:
+        match = MAGNITUDE_COL_PATTERN.search(str(col))
+        if match and match.group(1):
+            units.add(match.group(1).lower())
+    if 'db' in units:
+        return 'dB'
+    if 'ratio' in units:
+        return 'ratio'
+
+    header_content = ''.join(lines[:30])
+    if WRITER_VERSION_PATTERN.search(header_content):
+        logger.info("Writer_Version 2 header found: magnitude assumed to be in dB")
+        return 'dB'
+    return 'ratio'
+
+
+def magnitude_to_ratio(magnitude, unit: str):
+    """Convert magnitude values to a linear ratio (dB: ratio = 10^(mag/20))."""
+    if unit == 'dB':
+        return np.power(10.0, magnitude / 20.0)
+    return magnitude
 
 
 def extract_resistor_value(lines: list) -> Tuple[float, bool]:
@@ -277,20 +276,24 @@ def parse_oe_psip_format(lines: list) -> Tuple[Optional[pd.DataFrame], Optional[
     if not resistor_found:
         st.warning(f"Could not find resistor value in file. Using default {DEFAULT_REF_RESISTOR} Ohms")
     
-    # Identify key line positions
-    channel_line_idx = header_end_index + 1
-    col_name_line_idx = header_end_index + 2
-    data_start_idx = header_end_index + 3
-    
+    # Identify key line positions. Multi-channel files have a channel line
+    # followed by a column name line; LabVIEW-style (Writer_Version 2) files put
+    # the column names directly after the marker.
+    first_line_idx = header_end_index + 1
+    if first_line_idx < len(lines) and 'frequency' in lines[first_line_idx].lower():
+        channel_line = ''
+        col_name_line_idx = first_line_idx
+    else:
+        channel_line = lines[first_line_idx] if first_line_idx < len(lines) else ''
+        col_name_line_idx = header_end_index + 2
+    data_start_idx = col_name_line_idx + 1
+
     # Build column headers
-    if channel_line_idx >= len(lines) or col_name_line_idx >= len(lines):
+    if col_name_line_idx >= len(lines):
         st.error("File structure is incomplete. Missing channel or column name lines.")
         return None, None
-    
-    unique_columns = build_column_headers(
-        lines[channel_line_idx],
-        lines[col_name_line_idx]
-    )
+
+    unique_columns = build_column_headers(channel_line, lines[col_name_line_idx])
     
     # Check data consistency - trim headers if needed
     if data_start_idx < len(lines):
@@ -361,15 +364,16 @@ def validate_dataframe(df: pd.DataFrame) -> bool:
 
 
 @st.cache_data
-def parse_sip_file(uploaded_file) -> Tuple[Optional[pd.DataFrame], Optional[float], Optional[str]]:
+def parse_sip_file(uploaded_file) -> Tuple[Optional[pd.DataFrame], Optional[float], Optional[str], Optional[str]]:
     """Parse SIP file with automatic format detection.
     
     Args:
         uploaded_file: Streamlit uploaded file object
         
     Returns:
-        Tuple of (DataFrame with parsed data, reference resistor value, format type)
-        Returns (None, None, None) if parsing fails
+        Tuple of (DataFrame with parsed data, reference resistor value, format type,
+        magnitude unit 'ratio' or 'dB')
+        Returns (None, None, None, None) if parsing fails
     """
     # Read file content
     try:
@@ -383,13 +387,13 @@ def parse_sip_file(uploaded_file) -> Tuple[Optional[pd.DataFrame], Optional[floa
                 "Try opening it in a text editor to verify the format."
             )
             logger.error(f"File decoding failed: {e}")
-            return None, None, None
+            return None, None, None, None
     
     lines = stringio.readlines()
     
     if not lines:
         st.error("File is empty")
-        return None, None, None
+        return None, None, None, None
     
     # Detect file format
     file_format = detect_file_format(lines)
@@ -407,17 +411,19 @@ def parse_sip_file(uploaded_file) -> Tuple[Optional[pd.DataFrame], Optional[floa
             "- O&E PSIP files (with ***End_Of_Header*** marker)\n"
             "- Simple table files (Freq/Magnitude/Phase columns)"
         )
-        return None, None, None
+        return None, None, None, None
     
     if df is None:
-        return None, None, None
+        return None, None, None, None
     
     # Validate the parsed data
     if not validate_dataframe(df):
-        return None, None, None
+        return None, None, None, None
     
-    logger.info(f"Successfully parsed file as {format_name}")
-    return df, ref_resistor, format_name
+    magnitude_unit = detect_magnitude_unit(lines, df.columns.tolist())
+    
+    logger.info(f"Successfully parsed file as {format_name} (magnitude unit: {magnitude_unit})")
+    return df, ref_resistor, format_name, magnitude_unit
 
 
 # ============================================================================
@@ -428,12 +434,13 @@ def calculate_physics_properties(
     sip_data: pd.DataFrame,
     reference_resistor: float,
     sample_length: float,
-    sample_area: float
+    sample_area: float,
+    magnitude_unit: str = 'ratio'
 ) -> pd.DataFrame:
     """Calculate resistance, resistivity, and conductivity for all channels.
     
     Uses formulas according the Excel worksheet:
-    - Resistance = Magnitude × Reference Resistor
+    - Resistance = Magnitude × Reference Resistor (dB magnitudes: R_ref × 10^(mag/20))
     - Resistivity = (Resistance × Area) / Length
     - Fluid Conductivity = (1 / Resistivity) × 10000 (μS/cm)
     - Real Conductivity = (1 / Resistivity) × cos(Phase) (S/m)
@@ -446,16 +453,17 @@ def calculate_physics_properties(
         reference_resistor: Reference resistor value in Ohms
         sample_length: Sample length in meters
         sample_area: Sample cross-sectional area in square meters
+        magnitude_unit: 'ratio' or 'dB'; applies to every magnitude column
         
     Returns:
         DataFrame with calculated properties added
     """
     # Find all Magnitude columns to calculate physics for each channel
-    magnitude_columns = [c for c in sip_data.columns if 'Magnitude[ratio]' in c]
+    magnitude_columns = [c for c in sip_data.columns if MAGNITUDE_COL_PATTERN.search(c)]
     
     if not magnitude_columns:
         logger.warning("No magnitude columns found for calculations")
-        st.info("No Magnitude[ratio] columns found. Skipping physics calculations. "
+        st.info("No Magnitude[ratio] or Magnitude[dB] columns found. Skipping physics calculations. "
                "The file may only contain frequency sweep data.")
         return sip_data
     
@@ -463,23 +471,26 @@ def calculate_physics_properties(
     
     
     for mag_col in magnitude_columns:
-        # Extract prefix (e.g., "Chan-1")
-        prefix = mag_col.replace(' Magnitude[ratio]', '')
+        # Extract prefix (e.g., "Chan-1"); empty for single-channel files
+        prefix = mag_col[:MAGNITUDE_COL_PATTERN.search(mag_col).start()].strip()
+        
+        def chan_col(name: str) -> str:
+            return f"{prefix} {name}" if prefix else name
         
         # Find corresponding Phase column
-        phase_col = f"{prefix} Phase_Shift[rad]"
+        phase_col = chan_col("Phase_Shift[rad]")
         has_phase = phase_col in sip_data.columns
         
-        # D: Resistance (Ω) = Magnitude × Reference Resistor
-        resistance_col = f"{prefix} Resistance (Ohms)"
-        sip_data[resistance_col] = sip_data[mag_col] * reference_resistor
+        # D: Resistance (Ω) = Magnitude (as ratio) × Reference Resistor
+        resistance_col = chan_col("Resistance (Ohms)")
+        sip_data[resistance_col] = magnitude_to_ratio(sip_data[mag_col], magnitude_unit) * reference_resistor
         
         # E: Resistivity (Ω·m) = (Resistance × Area) / Length
-        resistivity_col = f"{prefix} Resistivity (Ohm-m)"
+        resistivity_col = chan_col("Resistivity (Ohm-m)")
         sip_data[resistivity_col] = (sip_data[resistance_col] * sample_area) / sample_length
         
         # F: Fluid Conductivity (μS/cm) = (1 / Resistivity) × 10000
-        fluid_cond_col = f"{prefix} Fluid Conductivity (uS/cm)"
+        fluid_cond_col = chan_col("Fluid Conductivity (uS/cm)")
         sip_data[fluid_cond_col] = np.where(
             sip_data[resistivity_col] > MIN_RESISTIVITY_THRESHOLD,
             (1 / sip_data[resistivity_col]) * 10000,
@@ -487,7 +498,7 @@ def calculate_physics_properties(
         )
         
         # J: Cell Constant K = 1,000,000 × 0.1606 / Resistance
-        k_col = f"{prefix} Cell Constant K"
+        k_col = chan_col("Cell Constant K")
         sip_data[k_col] = np.where(
             sip_data[resistance_col] > 1e-10,
             1000000 * CELL_CONSTANT_FACTOR / sip_data[resistance_col],
@@ -497,11 +508,11 @@ def calculate_physics_properties(
         # Phase-dependent calculations (only if phase data available)
         if has_phase:
             # G: Phase in milliradians = -Phase × 1000
-            phase_mrad_col = f"{prefix} Phase (mRads)"
+            phase_mrad_col = chan_col("Phase (mRads)")
             sip_data[phase_mrad_col] = -sip_data[phase_col] * 1000
             
             # H: Imaginary Conductivity (S/m) = -(1 / Resistivity) × sin(Phase)
-            imag_cond_col = f"{prefix} Imaginary Conductivity (S/m)"
+            imag_cond_col = chan_col("Imaginary Conductivity (S/m)")
             sip_data[imag_cond_col] = np.where(
                 sip_data[resistivity_col] > MIN_RESISTIVITY_THRESHOLD,
                 -(1 / sip_data[resistivity_col]) * np.sin(sip_data[phase_col]),
@@ -509,7 +520,7 @@ def calculate_physics_properties(
             )
             
             # I: Real Conductivity (S/m) = (1 / Resistivity) × cos(Phase)
-            real_cond_col = f"{prefix} Real Conductivity (S/m)"
+            real_cond_col = chan_col("Real Conductivity (S/m)")
             sip_data[real_cond_col] = np.where(
                 sip_data[resistivity_col] > MIN_RESISTIVITY_THRESHOLD,
                 (1 / sip_data[resistivity_col]) * np.cos(sip_data[phase_col]),
@@ -517,7 +528,7 @@ def calculate_physics_properties(
             )
             
             # K: Imaginary Conductivity in μS/cm = Imaginary Conductivity × 10000
-            imag_cond_uscm_col = f"{prefix} Imaginary Conductivity (uS/cm)"
+            imag_cond_uscm_col = chan_col("Imaginary Conductivity (uS/cm)")
             sip_data[imag_cond_uscm_col] = sip_data[imag_cond_col] * 10000
     
     return sip_data
@@ -1636,6 +1647,12 @@ def main():
         sample_length = st.number_input("Sample Length (m)", value=DEFAULT_SAMPLE_LENGTH, format="%.4f")
         sample_area = st.number_input("Sample Area (m²)", value=DEFAULT_SAMPLE_AREA, format="%.4f")
         manual_ref = st.number_input("Reference Resistor (Ohms)", value=0.0)
+        magnitude_unit_choice = st.selectbox(
+            "Magnitude unit",
+            options=["Auto-detect", "ratio", "dB"],
+            help="Auto-detect reads the column unit (Magnitude[ratio] / Magnitude[dB]) "
+                 "or the 'Writer_Version,2' header, which stores magnitude in dB."
+        )
  
     if not uploaded_files:
         st.info("Please upload SIP file(s) to begin")
@@ -1667,15 +1684,21 @@ def main():
     processed_datasets = {}
     for uploaded_file in uploaded_files:
         file_key = uploaded_file.name
-        sip_data, file_ref_resistor, format_name = parse_sip_file(uploaded_file)
+        sip_data, file_ref_resistor, format_name, detected_unit = parse_sip_file(uploaded_file)
         if sip_data is None:
             st.error(f"Failed to parse {file_key}")
             continue
-        st.success(f"Loaded: **{file_key}** ({format_name})")
+        if magnitude_unit_choice == "Auto-detect":
+            magnitude_unit = detected_unit
+            unit_note = f"magnitude unit: {detected_unit} (detected)"
+        else:
+            magnitude_unit = magnitude_unit_choice
+            unit_note = f"magnitude unit: {magnitude_unit} (manual; detected {detected_unit})"
+        st.success(f"Loaded: **{file_key}** ({format_name}, {unit_note})")
         reference_resistor = manual_ref if manual_ref > 0 else file_ref_resistor
         with st.spinner(f"Calculating properties for {file_key}..."):
             sip_data = calculate_physics_properties(
-                sip_data, reference_resistor, sample_length, sample_area
+                sip_data, reference_resistor, sample_length, sample_area, magnitude_unit
             )
         if 'Loop' in sip_data.columns:
             sip_data['Loop'] = sip_data['Loop'].astype(str)
