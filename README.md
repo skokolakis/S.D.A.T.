@@ -54,6 +54,7 @@ numpy>=1.24.0
 
 **Features:**
 - Metadata extraction (reference resistor, version, etc.)
+- Magnitude as a ratio or in dB (`Magnitude[dB]` columns or `Writer_Version,2` files: R = R_ref · 10^(mag/20)), auto-detected with a manual override in the sidebar
 - Multi-channel support (unlimited channels)
 - Multiple measurement loops
 - Timestamp information
