@@ -28,6 +28,13 @@ SIP Data Analyzer transforms tedious manual Excel workflows into a seamless, aut
 - Logarithmic scaling options
 - Hover tooltips for precise value inspection
 
+### Debye Decomposition
+- Fits ρ(ω) = ρ0·[1 − Σ m_k·(1 − 1/(1 + iωτ_k))] to every file/channel/loop spectrum on a log-spaced τ grid (measured range ± 1 decade)
+- Smoothness-regularised non-negative least squares on the real and imaginary parts; λ is chosen automatically or set manually
+- Shows the fitted curve over the measured phase and magnitude with the RMS misfit, and the relaxation-time distribution m(τ)
+- Integral parameters (Weigand & Kemna, 2016): ρ0, m_tot, m_tot_n, τ_mean, τ_10/τ_50/τ_60, U_tau = τ_60/τ_10 and τ peaks, exportable as CSV
+- Implemented from the published equations with SciPy (no GPL code, no extra dependencies)
+
 ### Fluid Calibration Check
 - Overlay the theoretical fluid phase φ(ω) = arctan(ε_r·ε0·ω/σ) (in mrad, same sign as `Phase (mRads)`) with a ± tolerance band
 - Fluid conductivity defaults to the measured low-frequency value; ε_r (default 81) and tolerance (default ±0.05 mrad) are adjustable
@@ -58,6 +65,13 @@ pandas>=2.0.0
 plotly>=5.17.0
 numpy>=1.24.0
 ```
+## Running the tests
+
+```
+pip install pytest
+python -m pytest
+```
+
 ## Supported File Formats
     O&E PSIP Format (.csv)
 

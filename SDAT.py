@@ -937,6 +937,356 @@ def show_fluid_deviation_table(datasets: Dict[str, pd.DataFrame], freq_col: str,
 
 
 # ============================================================================
+# DEBYE DECOMPOSITION
+# ============================================================================
+# Lightweight Debye decomposition (DD) written from the published equations
+# (Nordsiek & Weller 2008; Weigand & Kemna 2016), not from the GPL DD tools:
+#
+#   ρ(ω) = ρ0 · [1 − Σ_k m_k · (1 − 1/(1 + iωτ_k))]
+#
+# With g_k = ρ0·m_k the model is linear in (ρ0, g):  ρ(ω) = ρ0 − Σ_k g_k · K_k(ω),
+# K_k(ω) = iωτ_k / (1 + iωτ_k). The real and imaginary parts are fitted together by
+# a smoothness-regularised non-negative least-squares solve; the regularisation
+# strength λ is picked automatically by a discrepancy criterion unless given.
+DD_TAU_PER_DECADE = 10
+DD_TAU_EXTENSION_DECADES = 1.0
+DD_MAGNITUDE_ERROR = 1e-3   # assumed relative error of |ρ| (0.1 %)
+DD_PHASE_ERROR = 1e-4       # assumed phase error in rad (0.1 mrad)
+DD_LAMBDAS = np.logspace(-2, 10, 49)
+
+
+def dd_tau_grid(freq, tau_per_decade: int = DD_TAU_PER_DECADE,
+                extension_decades: float = DD_TAU_EXTENSION_DECADES) -> np.ndarray:
+    """Log-spaced τ grid covering 1/(2πf) for the measured frequencies, extended on both sides."""
+    freq = np.asarray(freq, dtype=float)
+    log_tau_min = np.log10(1 / (2 * np.pi * freq.max())) - extension_decades
+    log_tau_max = np.log10(1 / (2 * np.pi * freq.min())) + extension_decades
+    n_tau = int(np.ceil((log_tau_max - log_tau_min) * tau_per_decade)) + 1
+    return np.logspace(log_tau_min, log_tau_max, n_tau)
+
+
+def dd_forward(freq, rho0: float, m, tau) -> np.ndarray:
+    """Complex resistivity of the Debye decomposition model."""
+    wt = 2 * np.pi * np.asarray(freq, dtype=float)[:, None] * np.asarray(tau)[None, :]
+    return rho0 * (1 - np.sum(np.asarray(m)[None, :] * (1 - 1 / (1 + 1j * wt)), axis=1))
+
+
+def _dd_solve(design: np.ndarray, data: np.ndarray, smoothing: np.ndarray, lam: float):
+    """Regularised NNLS: min ||A x − d||² + λ ||L x||², x ≥ 0."""
+    a = np.vstack([design, np.sqrt(lam) * smoothing])
+    b = np.concatenate([data, np.zeros(smoothing.shape[0])])
+    x, _ = optimize.nnls(a, b, maxiter=50 * a.shape[1])
+    chi2 = float(np.sum((design @ x - data) ** 2))
+    return x, chi2
+
+
+def dd_integral_parameters(tau, m, rho0: float) -> Dict[str, float]:
+    """Integral parameters of a relaxation-time distribution m(τ).
+
+    m_tot = Σ m_k, m_tot_n = m_tot/ρ0, τ_mean = 10^(Σ m_k log10 τ_k / m_tot),
+    τ_x = τ where the cumulative chargeability reaches x %, U_tau = τ_60/τ_10,
+    τ_peak = local maxima of m(τ), listed from the largest τ (lowest frequency) down.
+    """
+    tau = np.asarray(tau, dtype=float)
+    m = np.asarray(m, dtype=float)
+    m_tot = float(np.sum(m))
+    params = {'rho0 (Ohm-m)': rho0, 'm_tot': m_tot,
+              'm_tot_n (S/m)': m_tot / rho0 if rho0 > 0 else np.nan}
+    if m_tot <= 0:
+        return {**params, 'tau_mean (s)': np.nan, 'tau_10 (s)': np.nan, 'tau_50 (s)': np.nan,
+                'tau_60 (s)': np.nan, 'U_tau': np.nan, 'tau_peak1 (s)': np.nan,
+                'tau_peaks (s)': '', 'n_peaks': 0}
+    log_tau = np.log10(tau)
+    cumulative = np.cumsum(m) / m_tot
+
+    def tau_x(fraction):
+        # First τ where the cumulative chargeability reaches the fraction (log-interpolated)
+        idx = int(np.searchsorted(cumulative, fraction))
+        if idx == 0:
+            return float(tau[0])
+        c0, c1 = cumulative[idx - 1], cumulative[idx]
+        w = (fraction - c0) / (c1 - c0) if c1 > c0 else 0.0
+        return float(10 ** (log_tau[idx - 1] + w * (log_tau[idx] - log_tau[idx - 1])))
+
+    padded = np.concatenate([[0.0], m, [0.0]])
+    peak_idx, _ = signal.find_peaks(padded, prominence=0.1 * m.max())
+    peaks = sorted(tau[peak_idx - 1], reverse=True)
+    tau_10, tau_60 = tau_x(0.10), tau_x(0.60)
+    return {
+        **params,
+        'tau_mean (s)': float(10 ** (np.sum(m * log_tau) / m_tot)),
+        'tau_10 (s)': tau_10,
+        'tau_50 (s)': tau_x(0.50),
+        'tau_60 (s)': tau_60,
+        'U_tau': tau_60 / tau_10,
+        'tau_peak1 (s)': float(peaks[0]) if peaks else np.nan,
+        'tau_peaks (s)': '; '.join(f"{p:.4g}" for p in peaks),
+        'n_peaks': len(peaks),
+    }
+
+
+def debye_decomposition(freq, rho_magnitude, phase_rad, lam: Optional[float] = None,
+                        tau_per_decade: int = DD_TAU_PER_DECADE,
+                        magnitude_error: float = DD_MAGNITUDE_ERROR,
+                        phase_error: float = DD_PHASE_ERROR) -> Dict:
+    """Fit a Debye decomposition to one complex resistivity spectrum.
+
+    Args:
+        freq: Frequencies (Hz)
+        rho_magnitude: |ρ| (Ohm-m)
+        phase_rad: Raw phase shift in rad (negative for a capacitive response,
+            i.e. PSIP 'Phase_Shift[rad]' = −Phase (mRads)/1000)
+        lam: Regularisation strength; None picks it automatically
+        tau_per_decade: τ grid density
+        magnitude_error: Assumed relative error of |ρ|, weights the real part
+        phase_error: Assumed phase error (rad), weights the imaginary part
+
+    Returns:
+        Dictionary with tau, m, rho0, lambda, fitted spectrum, misfit and integral parameters
+    """
+    freq = np.asarray(freq, dtype=float)
+    rho_magnitude = np.asarray(rho_magnitude, dtype=float)
+    phase_rad = np.asarray(phase_rad, dtype=float)
+    valid = (np.isfinite(freq) & np.isfinite(rho_magnitude) & np.isfinite(phase_rad)
+             & (freq > 0) & (rho_magnitude > 0))
+    order = np.argsort(freq[valid])
+    freq, rho_magnitude, phase_rad = (a[valid][order] for a in (freq, rho_magnitude, phase_rad))
+    if freq.size < 3:
+        raise ValueError("At least 3 frequencies are needed for a Debye decomposition")
+
+    tau = dd_tau_grid(freq, tau_per_decade)
+    scale = rho_magnitude[0]  # ≈ ρ0, keeps the unknowns of order one
+    rho = rho_magnitude * np.exp(1j * phase_rad) / scale
+
+    wt = 2 * np.pi * freq[:, None] * tau[None, :]
+    kernel = 1j * wt / (1 + 1j * wt)
+    model = np.hstack([np.ones((freq.size, 1)), -kernel])  # unknowns: [ρ0, g_1..g_n] / scale
+    sigma_re = magnitude_error * rho_magnitude / scale
+    sigma_im = phase_error * rho_magnitude / scale
+    design = np.vstack([model.real / sigma_re[:, None], model.imag / sigma_im[:, None]])
+    data = np.concatenate([rho.real / sigma_re, rho.imag / sigma_im])
+
+    # First-difference smoothing of the chargeabilities (ρ0 is not regularised)
+    smoothing = np.zeros((tau.size - 1, tau.size + 1))
+    idx = np.arange(tau.size - 1)
+    smoothing[idx, idx + 1] = -1.0
+    smoothing[idx, idx + 2] = 1.0
+
+    if lam is None:
+        # Discrepancy principle: the smoothest model whose misfit matches the assumed
+        # errors (χ² ≈ number of data), or stays close to the best achievable misfit
+        fits = [(l, *_dd_solve(design, data, smoothing, l)) for l in DD_LAMBDAS]
+        chi2_min = min(f[2] for f in fits)
+        target = max(data.size, 1.2 * chi2_min)
+        lam, x, chi2 = max((f for f in fits if f[2] <= target), key=lambda f: f[0])
+    else:
+        x, chi2 = _dd_solve(design, data, smoothing, lam)
+
+    rho0 = float(x[0] * scale)
+    m = x[1:] * scale / rho0 if rho0 > 0 else np.zeros(tau.size)
+    fitted = dd_forward(freq, rho0, m, tau)
+    rms_magnitude = float(np.sqrt(np.mean((np.abs(fitted) / rho_magnitude - 1) ** 2)) * 100)
+    rms_phase = float(np.sqrt(np.mean((np.angle(fitted) - phase_rad) ** 2)) * 1000)
+    return {
+        'tau': tau,
+        'm': m,
+        'rho0': rho0,
+        'lambda': float(lam),
+        'chi2': chi2,
+        'freq': freq,
+        'rho_magnitude': rho_magnitude,
+        'phase_rad': phase_rad,
+        'fitted': fitted,
+        'parameters': {
+            **dd_integral_parameters(tau, m, rho0),
+            'RMS |rho| misfit (%)': rms_magnitude,
+            'RMS phase misfit (mrad)': rms_phase,
+            'lambda': float(lam),
+            'f_min (Hz)': float(freq.min()),
+            'f_max (Hz)': float(freq.max()),
+            'n_freqs': int(freq.size),
+        },
+    }
+
+
+@st.cache_data(show_spinner=False)
+def fit_debye_decomposition(df: pd.DataFrame, channel: str, f_min: Optional[float] = None,
+                            f_max: Optional[float] = None, lam: Optional[float] = None,
+                            tau_per_decade: int = DD_TAU_PER_DECADE) -> Dict[str, Dict]:
+    """Run the Debye decomposition on every loop of one channel.
+
+    Uses the geometry-corrected resistivity magnitude and the raw phase shift.
+
+    Returns:
+        Dictionary mapping loop identifier ('All' without a Loop column) to the fit result
+    """
+    freq_col = find_frequency_column(df.columns.tolist())
+    mag_col = channel_column(channel, 'Resistivity (Ohm-m)')
+    phase_col = channel_column(channel, 'Phase_Shift[rad]')
+    if freq_col is None or mag_col not in df.columns or phase_col not in df.columns:
+        return {}
+    data = df
+    if f_min is not None:
+        data = data[data[freq_col] >= f_min]
+    if f_max is not None:
+        data = data[data[freq_col] <= f_max]
+    groups = data.groupby('Loop', sort=True) if 'Loop' in data.columns else [('All', data)]
+    results = {}
+    for loop, spectrum in groups:
+        try:
+            results[str(loop)] = debye_decomposition(
+                spectrum[freq_col], spectrum[mag_col], spectrum[phase_col],
+                lam=lam, tau_per_decade=tau_per_decade
+            )
+        except ValueError as e:
+            logger.warning(f"Debye decomposition skipped for loop {loop}: {e}")
+    return results
+
+
+def dd_results_table(results: Dict[Tuple[str, str], Dict[str, Dict]]) -> pd.DataFrame:
+    """Flatten {(file, channel): {loop: fit}} into one row of integral parameters per spectrum."""
+    rows = [
+        {'File': file_name, 'Channel': channel, 'Loop': loop, **fit['parameters']}
+        for (file_name, channel), loops in results.items()
+        for loop, fit in loops.items()
+    ]
+    return pd.DataFrame(rows)
+
+
+def create_dd_fit_figure(fit: Dict, title: str) -> go.Figure:
+    """Measured vs fitted phase and |ρ| (left) and the relaxation-time distribution m(τ) (right)."""
+    fig = make_subplots(
+        rows=2, cols=2, shared_xaxes=True, column_widths=[0.55, 0.45],
+        specs=[[{}, {"rowspan": 2}], [{}, None]],
+        vertical_spacing=0.1, horizontal_spacing=0.1,
+        subplot_titles=("Phase", "Relaxation-time distribution", "Resistivity magnitude")
+    )
+    freq = fit['freq']
+    dense_freq = np.logspace(np.log10(freq.min()), np.log10(freq.max()), 200)
+    model = dd_forward(dense_freq, fit['rho0'], fit['m'], fit['tau'])
+    measured = dict(mode='markers', marker=dict(size=7, color='#636EFA'), legendgroup='measured')
+    fitted = dict(mode='lines', line=dict(width=2, color='#EF553B'), legendgroup='fitted')
+    fig.add_trace(go.Scatter(x=freq, y=-fit['phase_rad'] * 1000, name='Measured', **measured), row=1, col=1)
+    fig.add_trace(go.Scatter(x=dense_freq, y=-np.angle(model) * 1000, name='DD fit', **fitted), row=1, col=1)
+    fig.add_trace(go.Scatter(x=freq, y=fit['rho_magnitude'], name='Measured', showlegend=False, **measured),
+                  row=2, col=1)
+    fig.add_trace(go.Scatter(x=dense_freq, y=np.abs(model), name='DD fit', showlegend=False, **fitted),
+                  row=2, col=1)
+    fig.add_trace(go.Scatter(
+        x=fit['tau'], y=fit['m'], mode='lines+markers', name='m(τ)',
+        line=dict(color='#00CC96'), marker=dict(size=4)
+    ), row=1, col=2)
+    params = fit['parameters']
+    for key, dash in (('tau_50 (s)', 'dash'), ('tau_mean (s)', 'dot')):
+        if np.isfinite(params[key]):
+            fig.add_vline(x=params[key], line=dict(dash=dash, color='gray'), row=1, col=2,
+                          annotation_text=key.replace(' (s)', ''), annotation_position='bottom right')
+    fig.update_xaxes(type='log')
+    fig.update_xaxes(title_text='Frequency (Hz)', row=2, col=1)
+    fig.update_xaxes(title_text='τ (s)', row=1, col=2)
+    fig.update_yaxes(title_text='Phase (mrad)', row=1, col=1)
+    fig.update_yaxes(title_text='|ρ| (Ohm-m)', row=2, col=1)
+    fig.update_yaxes(title_text='m', row=1, col=2)
+    fig.update_layout(title=dict(text=title, x=0.5, xanchor='center'), height=650)
+    return fig
+
+
+def render_debye_decomposition_section(datasets: Dict[str, pd.DataFrame], key_prefix: str):
+    """Debye decomposition UI: settings, per-spectrum fit plot, parameter table and CSV export."""
+    st.divider()
+    st.subheader("Debye Decomposition")
+    st.caption(
+        "Fits ρ(ω) = ρ0·[1 − Σ m_k·(1 − 1/(1 + iωτ_k))] to each spectrum on a log-spaced τ grid "
+        "(measured range ± 1 decade) with a smoothness-regularised non-negative least-squares fit, "
+        "and reports the integral parameters of Weigand & Kemna (2016)."
+    )
+    datasets = {name: df for name, df in datasets.items() if get_phase_channels(df.columns.tolist())}
+    if not datasets:
+        st.info("Debye decomposition needs resistivity and phase data.")
+        return
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if len(datasets) > 1:
+            files = st.multiselect("Files", options=list(datasets), default=list(datasets),
+                                   key=f"{key_prefix}_dd_files")
+        else:
+            files = list(datasets)
+        channels = sorted({ch for name in files for ch in get_phase_channels(datasets[name].columns.tolist())})
+        if not channels:
+            st.info("Select at least one file.")
+            return
+        channel = st.selectbox("Channel", options=channels, key=f"{key_prefix}_dd_channel")
+    with col2:
+        all_freqs = sorted({
+            float(f) for name in files
+            for f in datasets[name][find_frequency_column(datasets[name].columns.tolist())].dropna()
+            if f > 0
+        })
+        if len(all_freqs) < 3:
+            st.info("At least 3 frequencies are needed.")
+            return
+        f_min, f_max = st.select_slider(
+            "Frequency range (Hz)", options=all_freqs, value=(all_freqs[0], all_freqs[-1]),
+            format_func=lambda f: f"{float(f):g}", key=f"{key_prefix}_dd_frange",
+            help="Exclude e.g. high frequencies affected by electromagnetic coupling"
+        )
+    with col3:
+        lam_mode = st.radio("Regularisation λ", ["Auto", "Manual"], horizontal=True,
+                            key=f"{key_prefix}_dd_lam_mode",
+                            help="Auto picks the smoothest m(τ) that still fits the data to "
+                                 "0.1 % in |ρ| and 0.1 mrad in phase")
+        lam = None
+        if lam_mode == "Manual":
+            lam = 10 ** st.slider("log10(λ)", -2.0, 10.0, 4.0, 0.5, key=f"{key_prefix}_dd_lam")
+        tau_per_decade = st.number_input("τ values per decade", min_value=5, max_value=40,
+                                         value=DD_TAU_PER_DECADE, key=f"{key_prefix}_dd_tpd")
+
+    if not st.checkbox("Run Debye decomposition", key=f"{key_prefix}_dd_run"):
+        return
+
+    results = {}
+    with st.spinner("Fitting Debye decomposition..."):
+        for name in files:
+            fits = fit_debye_decomposition(datasets[name], channel, f_min, f_max, lam, int(tau_per_decade))
+            if fits:
+                results[(name, channel)] = fits
+            else:
+                st.warning(f"No Debye decomposition for {name} ({channel}).")
+    if not results:
+        return
+
+    table = dd_results_table(results)
+    spectra = [(name, ch, loop) for (name, ch), fits in results.items() for loop in fits]
+    selected = st.selectbox(
+        "Show fit for", options=spectra, key=f"{key_prefix}_dd_show",
+        format_func=lambda s: f"{s[0]} · {s[1]} · Loop {s[2]}"
+    )
+    fit = results[(selected[0], selected[1])][selected[2]]
+    st.plotly_chart(
+        create_dd_fit_figure(fit, f"{selected[0]} · {selected[1]} · Loop {selected[2]}"),
+        use_container_width=True, config=get_plot_config()
+    )
+    params = fit['parameters']
+    metric_cols = st.columns(5)
+    metric_cols[0].metric("ρ0 (Ohm-m)", f"{params['rho0 (Ohm-m)']:.4g}")
+    metric_cols[1].metric("m_tot", f"{params['m_tot']:.4g}")
+    metric_cols[2].metric("τ_50 (s)", f"{params['tau_50 (s)']:.3g}")
+    metric_cols[3].metric("RMS |ρ| misfit", f"{params['RMS |rho| misfit (%)']:.3f} %")
+    metric_cols[4].metric("RMS phase misfit", f"{params['RMS phase misfit (mrad)']:.3f} mrad")
+
+    st.markdown("**Integral parameters**")
+    st.dataframe(table, hide_index=True, use_container_width=True)
+    st.download_button(
+        label="Download DD parameters (CSV)",
+        data=table.to_csv(index=False).encode('utf-8'),
+        file_name="sip_debye_decomposition.csv",
+        mime="text/csv",
+        key=f"{key_prefix}_dd_download"
+    )
+
+
+# ============================================================================
 #PLOT CONFIGURATION HELPER
 # ============================================================================
 def get_plot_config():
@@ -2186,6 +2536,8 @@ def main():
             with col1:
                 get_export_ui(fig, "single_file")
  
+        render_debye_decomposition_section({file_key: sip_data}, "single_file")
+ 
         with st.expander("View Processed Data Table"):
             st.dataframe(sip_data, use_container_width=True)
         st.download_button(
@@ -2370,6 +2722,8 @@ def main():
             # Add export UI in sidebar
             with col1:
                 get_export_ui(fig, "comparison")
+ 
+        render_debye_decomposition_section(selected_files, "comparison")
  
         st.divider()
         st.subheader("Export Comparison Data")
