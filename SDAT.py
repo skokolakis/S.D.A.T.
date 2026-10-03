@@ -35,6 +35,9 @@ HEADER_MARKER = '***End_Of_Header***'
 RESISTOR_KEY = 'Current Resistor[Ohms]'
 MIN_RESISTIVITY_THRESHOLD = 1e-6  # Ohm-m, minimum value to avoid division issues
 CELL_CONSTANT_FACTOR = 0.1606  # Geometric factor for cell constant calculation
+VACUUM_PERMITTIVITY = 8.854e-12  # F/m
+WATER_RELATIVE_PERMITTIVITY = 81.0
+DEFAULT_FLUID_TOLERANCE_MRAD = 0.05
 # Magnitude columns, e.g. "Chan-1 Magnitude[ratio]", "Magnitude[dB]" or a bare "Magnitude"
 MAGNITUDE_COL_PATTERN = re.compile(r'Magnitude(?:\s*\[(ratio|dB)\])?\s*$', re.IGNORECASE)
 # PSIP writer version 2 files store magnitude in dB
@@ -807,6 +810,130 @@ def get_two_panel_settings_ui(columns: List[str], key_prefix: str = "") -> Optio
         'top_label': st.text_input("Top Y-Axis Label", value="Phase (mrad)", key=f"{key_prefix}_tp_toplabel"),
         'bottom_label': st.text_input("Bottom Y-Axis Label", value=bottom_quantity, key=f"{key_prefix}_tp_bottomlabel_{bottom_quantity}"),
     }
+
+
+# ============================================================================
+# FLUID CALIBRATION CHECK
+# ============================================================================
+
+def theoretical_fluid_phase_mrad(freq, sigma_uscm: float,
+                                 eps_r: float = WATER_RELATIVE_PERMITTIVITY) -> np.ndarray:
+    """Theoretical phase of a fluid with conductivity σ and permittivity ε_r·ε0.
+
+    φ(ω) = arctan(ε_r·ε0·ω / σ), returned in mrad and positive for a capacitive
+    response, matching SDAT's 'Phase (mRads)' = -Phase_Shift × 1000.
+
+    Args:
+        freq: Frequencies in Hz
+        sigma_uscm: Fluid conductivity in µS/cm
+        eps_r: Relative permittivity of the fluid (water ≈ 81)
+    """
+    sigma = sigma_uscm * 1e-4  # µS/cm -> S/m
+    omega = 2 * np.pi * np.asarray(freq, dtype=float)
+    return 1000 * np.arctan(eps_r * VACUUM_PERMITTIVITY * omega / sigma)
+
+
+def fluid_phase_deviation(freq, phase_mrad, sigma_uscm: float, eps_r: float,
+                          tolerance_mrad: float) -> Dict[str, float]:
+    """RMS / max deviation of a measured phase spectrum from the theoretical fluid phase."""
+    freq = np.asarray(freq, dtype=float)
+    phase_mrad = np.asarray(phase_mrad, dtype=float)
+    valid = np.isfinite(freq) & np.isfinite(phase_mrad)
+    deviation = phase_mrad[valid] - theoretical_fluid_phase_mrad(freq[valid], sigma_uscm, eps_r)
+    if deviation.size == 0:
+        return {'RMS deviation (mrad)': np.nan, 'Max |deviation| (mrad)': np.nan, 'Within tolerance (%)': np.nan}
+    return {
+        'RMS deviation (mrad)': float(np.sqrt(np.mean(deviation ** 2))),
+        'Max |deviation| (mrad)': float(np.max(np.abs(deviation))),
+        'Within tolerance (%)': float(100 * np.mean(np.abs(deviation) <= tolerance_mrad)),
+    }
+
+
+def measured_low_frequency_conductivity(df: pd.DataFrame, channel: str, freq_col: str) -> float:
+    """Mean measured fluid conductivity (µS/cm) at the lowest frequency, or NaN."""
+    cond_col = channel_column(channel, 'Fluid Conductivity (uS/cm)')
+    if df.empty or cond_col not in df.columns or freq_col not in df.columns:
+        return np.nan
+    lowest = df[df[freq_col] == df[freq_col].min()]
+    return float(lowest[cond_col].mean())
+
+
+def add_fluid_phase_overlay(fig: go.Figure, freq_min: float, freq_max: float,
+                            sigma_uscm: float, eps_r: float, tolerance_mrad: float,
+                            rows: Optional[List[int]] = None) -> go.Figure:
+    """Overlay the theoretical fluid phase curve and its ± tolerance band.
+
+    Args:
+        rows: Subplot rows holding a phase axis; None for a single-axis figure
+    """
+    freq = np.logspace(np.log10(freq_min), np.log10(freq_max), 200)
+    theory = theoretical_fluid_phase_mrad(freq, sigma_uscm, eps_r)
+    for idx, row in enumerate(rows or [None]):
+        position = dict(row=row, col=1) if row else {}
+        show = idx == 0
+        fig.add_trace(go.Scatter(
+            x=freq, y=theory + tolerance_mrad, mode='lines', line=dict(width=0),
+            name='Fluid tolerance band', legendgroup='fluid_theory', showlegend=False, hoverinfo='skip'
+        ), **position)
+        fig.add_trace(go.Scatter(
+            x=freq, y=theory - tolerance_mrad, mode='lines', line=dict(width=0),
+            fill='tonexty', fillcolor='rgba(150,150,150,0.3)',
+            name=f'± {tolerance_mrad:g} mrad tolerance', legendgroup='fluid_theory', showlegend=show,
+            hoverinfo='skip'
+        ), **position)
+        fig.add_trace(go.Scatter(
+            x=freq, y=theory, mode='lines', line=dict(color='#E45756', width=2, dash='dash'),
+            name=f'Theoretical fluid phase ({sigma_uscm:g} µS/cm)', legendgroup='fluid_theory',
+            showlegend=show
+        ), **position)
+    return fig
+
+
+def get_fluid_calibration_ui(phase_channel: Optional[str], default_sigma_uscm: float,
+                             key_suffix: str) -> Optional[Dict[str, float]]:
+    """Sidebar section for the fluid calibration check. Returns settings when enabled."""
+    with st.sidebar:
+        st.header("3. Fluid Calibration Check")
+        enabled = st.checkbox(
+            "Overlay theoretical fluid phase", key="fluid_check_enabled",
+            help="For calibration/QC measurements on water: φ = arctan(ε_r·ε0·ω/σ)"
+        )
+        if not enabled:
+            return None
+        if phase_channel is None:
+            st.info("Plot a Phase (mRads) column against frequency, or use the SIP two-panel plot, "
+                    "to see the overlay.")
+            return None
+        if not np.isfinite(default_sigma_uscm) or default_sigma_uscm <= 0:
+            default_sigma_uscm = 1000.0
+        sigma = st.number_input(
+            "Fluid conductivity (µS/cm)", min_value=0.001, value=float(round(default_sigma_uscm, 2)),
+            format="%.2f", key=f"fluid_sigma_{key_suffix}",
+            help="Defaults to the measured low-frequency Fluid Conductivity of the plotted channel"
+        )
+        eps_r = st.number_input("Relative permittivity ε_r", min_value=1.0,
+                                value=WATER_RELATIVE_PERMITTIVITY, key="fluid_eps_r")
+        tolerance = st.number_input("Tolerance band (± mrad)", min_value=0.0,
+                                    value=DEFAULT_FLUID_TOLERANCE_MRAD, step=0.01,
+                                    format="%.3f", key="fluid_tolerance")
+    return {'sigma': sigma, 'eps_r': eps_r, 'tolerance': tolerance, 'channel': phase_channel}
+
+
+def show_fluid_deviation_table(datasets: Dict[str, pd.DataFrame], freq_col: str,
+                               fluid: Dict[str, float],
+                               selected_loops: Dict[str, List[str]] = None):
+    """Show the RMS deviation of each plotted phase spectrum from the theoretical curve."""
+    phase_col = channel_column(fluid['channel'], PHASE_QUANTITY)
+    rows = []
+    for trace_name, df in iter_loop_traces(datasets, selected_loops):
+        if phase_col in df.columns and freq_col in df.columns:
+            rows.append({'Spectrum': trace_name, **fluid_phase_deviation(
+                df[freq_col], df[phase_col], fluid['sigma'], fluid['eps_r'], fluid['tolerance']
+            )})
+    if rows:
+        st.markdown(f"**Fluid calibration check** ({phase_col} vs theory for "
+                    f"{fluid['sigma']:g} µS/cm, ε_r = {fluid['eps_r']:g})")
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
 
 # ============================================================================
@@ -1985,6 +2112,19 @@ def main():
             
             # Get research-level plot customization
             style_config, use_colorblind, font_config, legend_config = get_research_customization_ui("single_file")
+        
+        # Fluid calibration check applies when phase is plotted against frequency
+        if two_panel:
+            phase_channel, freq_col = two_panel['channel'], two_panel['freq_col']
+        elif y_axis.endswith(PHASE_QUANTITY) and x_axis == find_frequency_column(all_cols):
+            phase_channel, freq_col = y_axis[:-len(PHASE_QUANTITY)].strip(), x_axis
+        else:
+            phase_channel, freq_col = None, find_frequency_column(all_cols)
+        fluid = get_fluid_calibration_ui(
+            phase_channel,
+            measured_low_frequency_conductivity(plot_data, phase_channel, freq_col) if phase_channel else np.nan,
+            f"single_{file_key}_{phase_channel}"
+        )
  
         with col2:
             if plot_data.empty:
@@ -2032,8 +2172,15 @@ def main():
             
             # Apply style customizations with fonts and legend
             fig = apply_style_to_figure(fig, style_config, line_colors, font_config, legend_config)
+            if fluid:
+                add_fluid_phase_overlay(
+                    fig, plot_data[freq_col].min(), plot_data[freq_col].max(),
+                    fluid['sigma'], fluid['eps_r'], fluid['tolerance'], rows=[1] if two_panel else None
+                )
             
             st.plotly_chart(fig, use_container_width=True, config=get_plot_config(), theme=None)
+            if fluid:
+                show_fluid_deviation_table({file_key: plot_data}, freq_col, fluid)
             
             # Add export UI in sidebar
             with col1:
@@ -2146,6 +2293,21 @@ def main():
             # Get research-level plot customization
             st.markdown("---")
             style_config, use_colorblind, font_config, legend_config = get_research_customization_ui("comparison")
+        
+        # Fluid calibration check applies when phase is plotted against frequency
+        if two_panel:
+            phase_channel, freq_col = two_panel['channel'], two_panel['freq_col']
+        elif y_axis.endswith(PHASE_QUANTITY) and x_axis == find_frequency_column(common_cols):
+            phase_channel, freq_col = y_axis[:-len(PHASE_QUANTITY)].strip(), x_axis
+        else:
+            phase_channel, freq_col = None, find_frequency_column(common_cols)
+        first_file = next(iter(selected_files), None)
+        fluid = get_fluid_calibration_ui(
+            phase_channel,
+            measured_low_frequency_conductivity(selected_files[first_file], phase_channel, freq_col)
+            if phase_channel and first_file else np.nan,
+            f"comparison_{first_file}_{phase_channel}"
+        )
  
         with col2:
             if not selected_files:
@@ -2188,8 +2350,22 @@ def main():
             
             # Apply style customizations with fonts and legend
             fig = apply_style_to_figure(fig, style_config, line_colors, font_config, legend_config)
+            if fluid:
+                all_freqs = pd.concat([df[freq_col] for df in selected_files.values()])
+                if two_panel:
+                    fluid_rows = [1]
+                elif plot_type == 'subplots':
+                    fluid_rows = list(range(1, len(selected_files) + 1))
+                else:
+                    fluid_rows = None
+                add_fluid_phase_overlay(
+                    fig, all_freqs.min(), all_freqs.max(),
+                    fluid['sigma'], fluid['eps_r'], fluid['tolerance'], rows=fluid_rows
+                )
             
             st.plotly_chart(fig, use_container_width=True, config=get_plot_config())
+            if fluid:
+                show_fluid_deviation_table(selected_files, freq_col, fluid, selected_loops)
             
             # Add export UI in sidebar
             with col1:
