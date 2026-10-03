@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_REF_RESISTOR = 100.0  # Ohms
 DEFAULT_SAMPLE_LENGTH = 0.03   # meters
 DEFAULT_SAMPLE_AREA = 0.002    # square meters
+DEFAULT_SAMPLE_DIAMETER = 0.0508  # meters (2" holder, area ≈ 0.002027 m²)
 HEADER_MARKER = '***End_Of_Header***'
 RESISTOR_KEY = 'Current Resistor[Ohms]'
 MIN_RESISTIVITY_THRESHOLD = 1e-6  # Ohm-m, minimum value to avoid division issues
@@ -294,6 +295,13 @@ def parse_oe_psip_format(lines: list) -> Tuple[Optional[pd.DataFrame], Optional[
         return None, None
 
     unique_columns = build_column_headers(channel_line, lines[col_name_line_idx])
+    if not channel_line:
+        # Single-channel layout: label measurement columns as Chan-1 so they line
+        # up with multi-channel PSIP files and the simple table format
+        unique_columns = [
+            f"Chan-1 {c}" if ('magnitude' in c.lower() or 'phase' in c.lower()) else c
+            for c in unique_columns
+        ]
     
     # Check data consistency - trim headers if needed
     if data_start_idx < len(lines):
@@ -532,6 +540,77 @@ def calculate_physics_properties(
             sip_data[imag_cond_uscm_col] = sip_data[imag_cond_col] * 10000
     
     return sip_data
+# ============================================================================
+# SAMPLE GEOMETRY
+# ============================================================================
+
+def area_from_diameter(diameter: float) -> float:
+    """Cross-sectional area (m²) of a cylindrical holder: π(d/2)²."""
+    return float(np.pi * (diameter / 2) ** 2)
+
+
+def get_per_file_geometry_ui(file_names: List[str], default_length: float,
+                             default_area: float, default_diameter: Optional[float]
+                             ) -> Dict[str, Dict[str, Optional[float]]]:
+    """Editable per-file geometry table, pre-filled from the global sample properties.
+
+    Args:
+        file_names: Uploaded file names
+        default_length: Global sample length (m)
+        default_area: Global sample area (m²)
+        default_diameter: Global diameter (m) when diameter input is used, else None
+
+    Returns:
+        Dictionary mapping file name to {'length', 'area', 'diameter'}
+    """
+    use_diameter = default_diameter is not None
+    size_col = "Diameter (m)" if use_diameter else "Area (m²)"
+    geometry_df = pd.DataFrame({
+        "File": file_names,
+        "Length (m)": [default_length] * len(file_names),
+        size_col: [default_diameter if use_diameter else default_area] * len(file_names),
+    })
+    edited = st.data_editor(
+        geometry_df,
+        hide_index=True,
+        disabled=["File"],
+        use_container_width=True,
+        key=f"geometry_editor_{size_col}",
+        column_config={
+            "Length (m)": st.column_config.NumberColumn(min_value=0.0, format="%.4f", step=0.0001),
+            size_col: st.column_config.NumberColumn(
+                min_value=0.0, format="%.4f" if use_diameter else "%.6f",
+                step=0.0001 if use_diameter else 0.000001
+            ),
+        }
+    )
+    
+    geometry = {}
+    for _, row in edited.iterrows():
+        length = row["Length (m)"]
+        size = row[size_col]
+        if pd.isna(length) or pd.isna(size) or length <= 0 or size <= 0:
+            st.warning(f"Invalid geometry for {row['File']}; using the global values.")
+            length = default_length
+            size = default_diameter if use_diameter else default_area
+        geometry[row["File"]] = {
+            'length': float(length),
+            'area': area_from_diameter(size) if use_diameter else float(size),
+            'diameter': float(size) if use_diameter else None,
+        }
+    return geometry
+
+
+def with_geometry_columns(df: pd.DataFrame, geometry: Dict[str, Optional[float]]) -> pd.DataFrame:
+    """Return a copy of df with the sample geometry used for it, for CSV export."""
+    df = df.copy()
+    df['Sample Length (m)'] = geometry['length']
+    df['Sample Area (m²)'] = geometry['area']
+    if geometry.get('diameter') is not None:
+        df['Sample Diameter (m)'] = geometry['diameter']
+    return df
+
+
 # ============================================================================
 #COMPARISON PLOT BUILDER
 # ============================================================================
@@ -1645,7 +1724,17 @@ def main():
         )
         st.header("2. Sample Properties")
         sample_length = st.number_input("Sample Length (m)", value=DEFAULT_SAMPLE_LENGTH, format="%.4f")
-        sample_area = st.number_input("Sample Area (m²)", value=DEFAULT_SAMPLE_AREA, format="%.4f")
+        size_input = st.radio("Cross-section input", ["Area", "Diameter"], horizontal=True)
+        if size_input == "Diameter":
+            sample_diameter = st.number_input(
+                "Sample Diameter (m)", value=DEFAULT_SAMPLE_DIAMETER, format="%.4f", min_value=0.0
+            )
+            sample_area = area_from_diameter(sample_diameter)
+            st.caption(f"Area = π(d/2)² = {sample_area:.6f} m²")
+        else:
+            sample_diameter = None
+            sample_area = st.number_input("Sample Area (m²)", value=DEFAULT_SAMPLE_AREA, format="%.6f")
+        global_geometry = {'length': sample_length, 'area': sample_area, 'diameter': sample_diameter}
         manual_ref = st.number_input("Reference Resistor (Ohms)", value=0.0)
         magnitude_unit_choice = st.selectbox(
             "Magnitude unit",
@@ -1680,8 +1769,19 @@ def main():
             """)
         return
  
+    # ── Per-file sample geometry (comparison mode) ──
+    file_geometry = {}
+    if mode == "Compare Multiple Files":
+        with st.expander("📐 Per-file sample geometry", expanded=False):
+            st.caption("Set length and cross-section per file (e.g. files measured in different holders). "
+                       "Rows start from the global sample properties in the sidebar.")
+            file_geometry = get_per_file_geometry_ui(
+                [f.name for f in uploaded_files], sample_length, sample_area, sample_diameter
+            )
+ 
     # ── Process each uploaded file ──
     processed_datasets = {}
+    dataset_geometry = {}
     for uploaded_file in uploaded_files:
         file_key = uploaded_file.name
         sip_data, file_ref_resistor, format_name, detected_unit = parse_sip_file(uploaded_file)
@@ -1696,14 +1796,16 @@ def main():
             unit_note = f"magnitude unit: {magnitude_unit} (manual; detected {detected_unit})"
         st.success(f"Loaded: **{file_key}** ({format_name}, {unit_note})")
         reference_resistor = manual_ref if manual_ref > 0 else file_ref_resistor
+        geometry = file_geometry.get(file_key, global_geometry)
         with st.spinner(f"Calculating properties for {file_key}..."):
             sip_data = calculate_physics_properties(
-                sip_data, reference_resistor, sample_length, sample_area, magnitude_unit
+                sip_data, reference_resistor, geometry['length'], geometry['area'], magnitude_unit
             )
         if 'Loop' in sip_data.columns:
             sip_data['Loop'] = sip_data['Loop'].astype(str)
         sip_data['Source_File'] = file_key
         processed_datasets[file_key] = sip_data
+        dataset_geometry[file_key] = geometry
  
     if not processed_datasets:
         st.error("No files were successfully processed")
@@ -1818,7 +1920,7 @@ def main():
             st.dataframe(sip_data, use_container_width=True)
         st.download_button(
             label="Download CSV",
-            data=sip_data.to_csv(index=False).encode('utf-8'),
+            data=with_geometry_columns(sip_data, dataset_geometry[file_key]).to_csv(index=False).encode('utf-8'),
             file_name=f"sip_processed_{file_key}",
             mime="text/csv"
         )
@@ -1831,7 +1933,9 @@ def main():
             summary_data.append({
                 "File": name, "Rows": len(df),
                 "Channels": len(channels) if channels else 1,
-                "Loops": len(df['Loop'].unique()) if 'Loop' in df.columns else 1
+                "Loops": len(df['Loop'].unique()) if 'Loop' in df.columns else 1,
+                "Length (m)": dataset_geometry[name]['length'],
+                "Area (m²)": dataset_geometry[name]['area']
             })
         st.dataframe(pd.DataFrame(summary_data), use_container_width=True)
         st.divider()
@@ -1952,7 +2056,10 @@ def main():
         st.divider()
         st.subheader("Export Comparison Data")
         if st.button("Combine All Data into Single CSV"):
-            combined_df = pd.concat(processed_datasets.values(), ignore_index=True)
+            combined_df = pd.concat(
+                [with_geometry_columns(df, dataset_geometry[name]) for name, df in processed_datasets.items()],
+                ignore_index=True
+            )
             st.download_button(
                 label="Download Combined CSV",
                 data=combined_df.to_csv(index=False).encode('utf-8'),

@@ -64,7 +64,7 @@ def test_writer_v2_db_file_matches_ratio_file(header):
     db_df, unit = process(writer_v2_file(header))
     assert unit == "dB"
     np.testing.assert_allclose(resistivity(db_df), resistivity(ratio_df), rtol=1e-9)
-    assert "Phase (mRads)" in db_df.columns
+    assert "Chan-1 Phase (mRads)" in db_df.columns
 
 
 def test_column_unit_takes_precedence_over_writer_version():
