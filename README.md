@@ -12,7 +12,7 @@ SIP Data Analyzer transforms tedious manual Excel workflows into a seamless, aut
 - Physics calculations (Resistance, Resistivity, Conductivity)
 - Interactive multi-channel visualizations
 - Multi-loop comparison and analysis
-- CSV export of processed data
+- CSV export of processed data (including the sample geometry used for each file)
 
 ## Features
 
@@ -27,6 +27,10 @@ SIP Data Analyzer transforms tedious manual Excel workflows into a seamless, aut
 - Dual Y-axis support for comparing different parameters
 - Logarithmic scaling options
 - Hover tooltips for precise value inspection
+
+### Sample Geometry
+- Enter the sample cross-section as an area or as a holder diameter (area = π(d/2)²)
+- In comparison mode, set length and diameter/area per file, so files measured in different holders get correct resistivities
 
 ### Robust Data Handling
 - Handles files with multiple header sections
