@@ -703,6 +703,113 @@ def create_comparison_plot(datasets: Dict[str, pd.DataFrame], x_col: str, y_col:
     )
     return fig
 # ============================================================================
+# SIP TWO-PANEL PLOT (phase over magnitude/conductivity)
+# ============================================================================
+PHASE_QUANTITY = 'Phase (mRads)'
+SIP_BOTTOM_QUANTITIES = [
+    'Resistivity (Ohm-m)',
+    'Fluid Conductivity (uS/cm)',
+    'Real Conductivity (S/m)',
+    'Imaginary Conductivity (S/m)',
+    'Imaginary Conductivity (uS/cm)',
+    'Resistance (Ohms)',
+]
+
+
+def channel_column(channel: str, quantity: str) -> str:
+    """Column name for a channel quantity, e.g. ('Chan-1', 'Phase (mRads)')."""
+    return f"{channel} {quantity}" if channel else quantity
+
+
+def get_phase_channels(columns: List[str]) -> List[str]:
+    """Channel prefixes that have a calculated phase column (e.g. ['Chan-1', 'Chan-2'])."""
+    return [c[:-len(PHASE_QUANTITY)].strip() for c in columns if str(c).endswith(PHASE_QUANTITY)]
+
+
+def find_frequency_column(columns: List[str]) -> Optional[str]:
+    """Return the frequency column name, if any."""
+    return next((c for c in columns if 'frequency' in str(c).lower()), None)
+
+
+def iter_loop_traces(datasets: Dict[str, pd.DataFrame], selected_loops: Dict[str, List[str]] = None):
+    """Yield (trace_name, dataframe) per file and loop, honouring the loop selection."""
+    for name, df in datasets.items():
+        if selected_loops and selected_loops.get(name) and 'Loop' in df.columns:
+            df = df[df['Loop'].isin(selected_loops[name])]
+        if df.empty:
+            continue
+        if 'Loop' in df.columns and len(df['Loop'].unique()) > 1:
+            for loop in sorted(df['Loop'].unique()):
+                trace_name = f"Loop {loop}" if len(datasets) == 1 else f"{name} - L{loop}"
+                yield trace_name, df[df['Loop'] == loop]
+        else:
+            yield name, df
+
+
+def create_sip_two_panel_plot(datasets: Dict[str, pd.DataFrame], channel: str,
+                              bottom_quantity: str, freq_col: str,
+                              log_x: bool = True, log_y_bottom: bool = False,
+                              selected_loops: Dict[str, List[str]] = None,
+                              title: str = None, x_label: str = None,
+                              top_label: str = None, bottom_label: str = None) -> go.Figure:
+    """Standard SIP figure: phase on top, magnitude/conductivity below, shared log-frequency axis."""
+    phase_col = channel_column(channel, PHASE_QUANTITY)
+    bottom_col = channel_column(channel, bottom_quantity)
+    
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06)
+    palette = px.colors.qualitative.Plotly
+    datasets = {name: df for name, df in datasets.items()
+                if {freq_col, phase_col, bottom_col}.issubset(df.columns)}
+    for idx, (trace_name, df) in enumerate(iter_loop_traces(datasets, selected_loops)):
+        df = df.sort_values(freq_col)
+        color = palette[idx % len(palette)]
+        common = dict(
+            x=df[freq_col], mode='lines+markers', name=trace_name, legendgroup=trace_name,
+            line=dict(color=color), marker=dict(size=6, color=color)
+        )
+        fig.add_trace(go.Scatter(y=df[phase_col], showlegend=True, **common), row=1, col=1)
+        fig.add_trace(go.Scatter(y=df[bottom_col], showlegend=False, **common), row=2, col=1)
+    
+    fig.update_xaxes(type='log' if log_x else 'linear')
+    fig.update_xaxes(title_text=x_label or freq_col, row=2, col=1)
+    fig.update_yaxes(title_text=top_label or phase_col, row=1, col=1)
+    fig.update_yaxes(title_text=bottom_label or bottom_col,
+                     type='log' if log_y_bottom else 'linear', row=2, col=1)
+    fig.update_layout(
+        title=dict(text=title or f"{channel} SIP spectrum".strip(), x=0.5, xanchor='center', font=dict(size=16)),
+        height=750, hovermode='closest'
+    )
+    return fig
+
+
+def get_two_panel_settings_ui(columns: List[str], key_prefix: str = "") -> Optional[Dict[str, str]]:
+    """Sidebar-column UI for the two-panel plot. Returns None when no phase data exists."""
+    channels = get_phase_channels(columns)
+    if not channels:
+        st.warning("No phase data available for a two-panel SIP plot.")
+        return None
+    channel = st.selectbox("Channel", options=channels, key=f"{key_prefix}_tp_channel")
+    quantities = [q for q in SIP_BOTTOM_QUANTITIES if channel_column(channel, q) in columns]
+    bottom_quantity = st.selectbox(
+        "Bottom panel", options=quantities, key=f"{key_prefix}_tp_bottom",
+        help="Magnitude or conductivity quantity plotted below the phase"
+    )
+    freq_col = find_frequency_column(columns)
+    st.markdown("---")
+    st.markdown("**Customize Labels:**")
+    # Label keys include the selection so defaults follow channel/quantity changes
+    return {
+        'channel': channel,
+        'bottom_quantity': bottom_quantity,
+        'freq_col': freq_col,
+        'title': st.text_input("Plot Title", value=f"{channel} SIP spectrum", key=f"{key_prefix}_tp_title_{channel}"),
+        'x_label': st.text_input("X-Axis Label", value="Frequency (Hz)", key=f"{key_prefix}_tp_xlabel"),
+        'top_label': st.text_input("Top Y-Axis Label", value="Phase (mrad)", key=f"{key_prefix}_tp_toplabel"),
+        'bottom_label': st.text_input("Bottom Y-Axis Label", value=bottom_quantity, key=f"{key_prefix}_tp_bottomlabel_{bottom_quantity}"),
+    }
+
+
+# ============================================================================
 #PLOT CONFIGURATION HELPER
 # ============================================================================
 def get_plot_config():
@@ -923,7 +1030,7 @@ def apply_style_to_figure(fig, style_config, line_colors=None, font_config=None,
         legend_config = {
             'show': True,
             'title': '',
-            'orientation': 'vertical',
+            'orientation': 'v',
             'x': 0.01,
             'y': 0.99,
             'xanchor': 'left',
@@ -965,23 +1072,22 @@ def apply_style_to_figure(fig, style_config, line_colors=None, font_config=None,
                 size=font_config['title_size']
             )
         ),
-        xaxis=dict(
-            gridcolor=grid_rgba,
-            zerolinecolor=zeroline_rgba,
-            color=style_config['axis_color'],
-            title=dict(font=dict(size=font_config['axis_label_size'])),
-            tickfont=dict(size=font_config['tick_size'])
-        ),
-        yaxis=dict(
-            gridcolor=grid_rgba,
-            zerolinecolor=zeroline_rgba,
-            color=style_config['axis_color'],
-            title=dict(font=dict(size=font_config['axis_label_size'])),
-            tickfont=dict(size=font_config['tick_size'])
-        ),
         legend=legend_dict,
         showlegend=legend_config['show']
     )
+    
+    # Style every x/y axis so multi-panel figures (subplots) are styled consistently
+    axis_style = dict(
+        gridcolor=grid_rgba,
+        zerolinecolor=zeroline_rgba,
+        color=style_config['axis_color'],
+        title_font=dict(size=font_config['axis_label_size']),
+        tickfont=dict(size=font_config['tick_size'])
+    )
+    fig.update_xaxes(**axis_style)
+    fig.update_yaxes(**axis_style)
+    # Subplot titles are annotations; keep them in the title colour
+    fig.update_annotations(font=dict(color=style_config['title_color']))
     
     # Apply line colors and settings
     if line_colors:
@@ -1756,7 +1862,7 @@ def main():
             ### Interactive Visualization
             - Multi-channel plotting with customizable axes
             - Loop filtering and comparison
-            - Dual Y-axis support for comparing different parameters
+            - SIP two-panel plot: phase over magnitude/conductivity on a shared log-frequency axis
             - Logarithmic scaling options
             - Hover tooltips for precise value inspection
             
@@ -1833,16 +1939,24 @@ def main():
         with col1:
             st.subheader("Plot Settings")
             all_cols = sip_data.columns.tolist()
-            default_x = next((i for i, col in enumerate(all_cols) if 'frequency' in col.lower()), 0)
-            default_y = max(0, len(all_cols) - 1)
-            x_axis = st.selectbox("X-Axis", options=all_cols, index=default_x)
-            y_axis = st.selectbox("Y-Axis", options=all_cols, index=default_y)
-            st.markdown("---")
-            st.markdown("**Customize Labels:**")
-            default_title = f"{y_axis} vs {x_axis}"
-            custom_title = st.text_input("Plot Title", value=default_title)
-            custom_x_label = st.text_input("X-Axis Label", value=x_axis)
-            custom_y_label = st.text_input("Y-Axis Label", value=y_axis)
+            plot_mode = st.radio(
+                "Plot Mode", ["Standard", "SIP two-panel"], key="single_file_plot_mode",
+                help="SIP two-panel: phase on top, magnitude/conductivity below, sharing the frequency axis"
+            )
+            two_panel = None
+            if plot_mode == "SIP two-panel":
+                two_panel = get_two_panel_settings_ui(all_cols, "single_file")
+            if two_panel is None:
+                default_x = next((i for i, col in enumerate(all_cols) if 'frequency' in col.lower()), 0)
+                default_y = max(0, len(all_cols) - 1)
+                x_axis = st.selectbox("X-Axis", options=all_cols, index=default_x)
+                y_axis = st.selectbox("Y-Axis", options=all_cols, index=default_y)
+                st.markdown("---")
+                st.markdown("**Customize Labels:**")
+                default_title = f"{y_axis} vs {x_axis}"
+                custom_title = st.text_input("Plot Title", value=default_title)
+                custom_x_label = st.text_input("X-Axis Label", value=x_axis)
+                custom_y_label = st.text_input("Y-Axis Label", value=y_axis)
             st.markdown("---")
             if 'Loop' in sip_data.columns:
                 all_loops = sip_data['Loop'].unique()
@@ -1867,7 +1981,7 @@ def main():
             else:
                 plot_data = sip_data
             log_x = st.checkbox("Log Scale X-Axis", value=True)
-            log_y = st.checkbox("Log Scale Y-Axis", value=False)
+            log_y = st.checkbox("Log Scale Bottom Panel" if two_panel else "Log Scale Y-Axis", value=False)
             
             # Get research-level plot customization
             style_config, use_colorblind, font_config, legend_config = get_research_customization_ui("single_file")
@@ -1878,14 +1992,22 @@ def main():
                 return
             
             # Create initial figure
-            fig = px.line(
-                plot_data, x=x_axis, y=y_axis,
-                color='Loop' if 'Loop' in plot_data.columns else None,
-                markers=True, title=custom_title, log_x=log_x, log_y=log_y
-            )
+            if two_panel:
+                fig = create_sip_two_panel_plot(
+                    {file_key: plot_data}, two_panel['channel'], two_panel['bottom_quantity'],
+                    two_panel['freq_col'], log_x=log_x, log_y_bottom=log_y,
+                    title=two_panel['title'], x_label=two_panel['x_label'],
+                    top_label=two_panel['top_label'], bottom_label=two_panel['bottom_label']
+                )
+            else:
+                fig = px.line(
+                    plot_data, x=x_axis, y=y_axis,
+                    color='Loop' if 'Loop' in plot_data.columns else None,
+                    markers=True, title=custom_title, log_x=log_x, log_y=log_y
+                )
             
-            # Get trace names for line color customization
-            trace_names = [trace.name for trace in fig.data]
+            # Get trace names for line color customization (two-panel traces share names)
+            trace_names = list(dict.fromkeys(trace.name for trace in fig.data))
             
             # Show line color pickers in sidebar (inside col1)
             with col1:
@@ -1900,12 +2022,13 @@ def main():
                     line_colors = get_line_color_customization(trace_names, "single_file")
             
             # Apply customizations
-            fig.update_layout(
-                height=600, hovermode='closest',
-                title=dict(x=0.5, xanchor='center', font=dict(size=16)),
-                xaxis_title=custom_x_label,
-                yaxis_title=custom_y_label
-            )
+            if not two_panel:
+                fig.update_layout(
+                    height=600, hovermode='closest',
+                    title=dict(x=0.5, xanchor='center', font=dict(size=16)),
+                    xaxis_title=custom_x_label,
+                    yaxis_title=custom_y_label
+                )
             
             # Apply style customizations with fonts and legend
             fig = apply_style_to_figure(fig, style_config, line_colors, font_config, legend_config)
@@ -1950,30 +2073,40 @@ def main():
             if not common_cols:
                 st.error("No common columns found across all files")
                 return
-            default_x = next((i for i, col in enumerate(common_cols) if 'frequency' in col.lower()), 0)
-            x_axis = st.selectbox("X-Axis", options=common_cols, index=default_x)
-            numeric_common_cols = [
-                col for col in common_cols
-                if pd.api.types.is_numeric_dtype(
-                    processed_datasets[list(processed_datasets.keys())[0]].get(col, pd.Series(dtype=float))
-                )
-            ]
-            if not numeric_common_cols:
-                st.error("No common numeric columns for Y-axis")
-                return
-            y_axis = st.selectbox("Y-Axis", options=numeric_common_cols)
-            st.markdown("---")
-            st.markdown("**Customize Labels:**")
-            custom_title = st.text_input("Plot Title", value=f"{y_axis} vs {x_axis} - Comparison")
-            custom_x_label = st.text_input("X-Axis Label", value=x_axis)
-            custom_y_label = st.text_input("Y-Axis Label", value=y_axis)
-            st.markdown("---")
-            plot_type = st.radio(
-                "Plot Type", ["overlay", "subplots"],
-                format_func=lambda x: "Overlay (Single Plot)" if x == "overlay" else "Subplots (Separate Plots)"
+            plot_mode = st.radio(
+                "Plot Mode", ["Standard", "SIP two-panel"], key="comparison_plot_mode",
+                help="SIP two-panel: phase on top, magnitude/conductivity below, sharing the frequency axis"
             )
+            two_panel = None
+            if plot_mode == "SIP two-panel":
+                two_panel = get_two_panel_settings_ui(common_cols, "comparison")
+            if two_panel is None:
+                default_x = next((i for i, col in enumerate(common_cols) if 'frequency' in col.lower()), 0)
+                x_axis = st.selectbox("X-Axis", options=common_cols, index=default_x)
+                numeric_common_cols = [
+                    col for col in common_cols
+                    if pd.api.types.is_numeric_dtype(
+                        processed_datasets[list(processed_datasets.keys())[0]].get(col, pd.Series(dtype=float))
+                    )
+                ]
+                if not numeric_common_cols:
+                    st.error("No common numeric columns for Y-axis")
+                    return
+                y_axis = st.selectbox("Y-Axis", options=numeric_common_cols)
+                st.markdown("---")
+                st.markdown("**Customize Labels:**")
+                custom_title = st.text_input("Plot Title", value=f"{y_axis} vs {x_axis} - Comparison")
+                custom_x_label = st.text_input("X-Axis Label", value=x_axis)
+                custom_y_label = st.text_input("Y-Axis Label", value=y_axis)
+                st.markdown("---")
+                plot_type = st.radio(
+                    "Plot Type", ["overlay", "subplots"],
+                    format_func=lambda x: "Overlay (Single Plot)" if x == "overlay" else "Subplots (Separate Plots)"
+                )
+            else:
+                st.markdown("---")
             log_x = st.checkbox("Log Scale X-Axis", value=True)
-            log_y = st.checkbox("Log Scale Y-Axis", value=False)
+            log_y = st.checkbox("Log Scale Bottom Panel" if two_panel else "Log Scale Y-Axis", value=False)
             st.markdown("---")
             st.markdown("**Files to Compare:**")
             selected_files = {
@@ -2020,17 +2153,26 @@ def main():
                 return
             
             # Create initial figure
-            fig = create_comparison_plot(
-                selected_files, x_axis, y_axis,
-                log_x=log_x, log_y=log_y, plot_type=plot_type,
-                selected_loops=selected_loops,
-                custom_title=custom_title,
-                custom_x_label=custom_x_label,
-                custom_y_label=custom_y_label
-            )
+            if two_panel:
+                fig = create_sip_two_panel_plot(
+                    selected_files, two_panel['channel'], two_panel['bottom_quantity'],
+                    two_panel['freq_col'], log_x=log_x, log_y_bottom=log_y,
+                    selected_loops=selected_loops,
+                    title=two_panel['title'], x_label=two_panel['x_label'],
+                    top_label=two_panel['top_label'], bottom_label=two_panel['bottom_label']
+                )
+            else:
+                fig = create_comparison_plot(
+                    selected_files, x_axis, y_axis,
+                    log_x=log_x, log_y=log_y, plot_type=plot_type,
+                    selected_loops=selected_loops,
+                    custom_title=custom_title,
+                    custom_x_label=custom_x_label,
+                    custom_y_label=custom_y_label
+                )
             
-            # Get trace names for line color customization
-            trace_names = [trace.name for trace in fig.data]
+            # Get trace names for line color customization (two-panel traces share names)
+            trace_names = list(dict.fromkeys(trace.name for trace in fig.data))
             
             # Show line color pickers in sidebar (inside col1)
             with col1:

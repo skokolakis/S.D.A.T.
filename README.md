@@ -24,7 +24,7 @@ SIP Data Analyzer transforms tedious manual Excel workflows into a seamless, aut
 ### Interactive Visualization
 - Multi-channel plotting with customizable axes
 - Loop filtering and comparison
-- Dual Y-axis support for comparing different parameters
+- SIP two-panel plot: phase on top, magnitude/conductivity below, on a shared log-frequency axis
 - Logarithmic scaling options
 - Hover tooltips for precise value inspection
 
