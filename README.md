@@ -28,6 +28,11 @@ SIP Data Analyzer transforms tedious manual Excel workflows into a seamless, aut
 - Logarithmic scaling options
 - Hover tooltips for precise value inspection
 
+### Fluid Calibration Check
+- Overlay the theoretical fluid phase φ(ω) = arctan(ε_r·ε0·ω/σ) (in mrad, same sign as `Phase (mRads)`) with a ± tolerance band
+- Fluid conductivity defaults to the measured low-frequency value; ε_r (default 81) and tolerance (default ±0.05 mrad) are adjustable
+- Reports the RMS and maximum deviation of each measured phase spectrum from the theory
+
 ### Sample Geometry
 - Enter the sample cross-section as an area or as a holder diameter (area = π(d/2)²)
 - In comparison mode, set length and diameter/area per file, so files measured in different holders get correct resistivities
