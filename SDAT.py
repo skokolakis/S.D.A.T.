@@ -305,7 +305,9 @@ def parse_oe_psip_format(lines: list) -> Tuple[Optional[pd.DataFrame], Optional[
             unique_columns = unique_columns[:num_data_cols]
     
     # Load data section
-    stringio = io.StringIO('\n'.join(lines))
+    # Lines keep their own line endings; joining with a newline would add blank
+    # lines that skiprows counts, letting header rows leak into the data
+    stringio = io.StringIO(''.join(lines))
     try:
         df = pd.read_csv(
             stringio,
