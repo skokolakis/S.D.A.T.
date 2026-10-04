@@ -1,6 +1,8 @@
 """Tests for quantity labels and plot palettes used by the UI."""
 import re
 
+import numpy as np
+
 import pytest
 
 import SDAT
@@ -46,3 +48,27 @@ def test_publication_preset_is_white_with_boxed_log_axes():
     assert fig.layout.xaxis.mirror is True and fig.layout.xaxis.ticks == "outside"
     assert fig.layout.xaxis.dtick == 1 and fig.layout.xaxis.exponentformat == "power"
     assert fig.layout.yaxis.dtick is None
+
+
+def test_dark_palettes_avoid_invisible_lines():
+    for palette in SDAT.PALETTES:
+        colors = SDAT.palette_colors(palette, 8, dark=True)
+        assert "#000000" not in colors
+    assert SDAT.palette_colors("Greyscale", 2, dark=True)[0] == "#ffffff"
+
+
+def test_dark_preset_and_debye_figure():
+    style = SDAT.get_research_presets()[SDAT.DARK_STYLE_PRESET]
+    assert style["plot_bgcolor"] == "#0E1117" and style["axis_color"] == "#E6E8EB"
+    import numpy as np
+    f = np.logspace(-2, 4, 20)
+    rho = 50 * (1 - 0.05 * (1 - 1 / (1 + (1j * 2 * np.pi * f * 0.01) ** 0.5)))
+    fit = SDAT.debye_decomposition(f, np.abs(rho), np.angle(rho))
+    fig = SDAT.create_dd_fit_figure(fit, "t", dark=True)
+    assert fig.layout.plot_bgcolor == "#0E1117"
+    assert fig.data[0].marker.color == "#E6E8EB"
+
+
+def test_help_texts_cover_debye_parameters():
+    params = SDAT.debye_decomposition(np.logspace(-2, 4, 20), np.full(20, 10.0), np.full(20, -0.001))['parameters']
+    assert set(params) <= set(SDAT.DD_PARAMETER_HELP)
