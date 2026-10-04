@@ -30,10 +30,18 @@ logger = logging.getLogger(__name__)
 DEFAULT_REF_RESISTOR = 100.0  # Ohms
 DEFAULT_SAMPLE_LENGTH = 0.03   # meters
 DEFAULT_SAMPLE_AREA = 0.002    # square meters
+DEFAULT_SAMPLE_DIAMETER = 0.0508  # meters (2" holder, area ≈ 0.002027 m²)
 HEADER_MARKER = '***End_Of_Header***'
 RESISTOR_KEY = 'Current Resistor[Ohms]'
 MIN_RESISTIVITY_THRESHOLD = 1e-6  # Ohm-m, minimum value to avoid division issues
 CELL_CONSTANT_FACTOR = 0.1606  # Geometric factor for cell constant calculation
+VACUUM_PERMITTIVITY = 8.854e-12  # F/m
+WATER_RELATIVE_PERMITTIVITY = 81.0
+DEFAULT_FLUID_TOLERANCE_MRAD = 0.05
+# Magnitude columns, e.g. "Chan-1 Magnitude[ratio]", "Magnitude[dB]" or a bare "Magnitude"
+MAGNITUDE_COL_PATTERN = re.compile(r'Magnitude(?:\s*\[(ratio|dB)\])?\s*$', re.IGNORECASE)
+# PSIP writer version 2 files store magnitude in dB
+WRITER_VERSION_PATTERN = re.compile(r'^\s*Writer_Version\s*[,\t]\s*2\b', re.IGNORECASE | re.MULTILINE)
 
 # ============================================================================
 #STREAMLIT PAGE CONFIGURATION
@@ -41,7 +49,7 @@ CELL_CONSTANT_FACTOR = 0.1606  # Geometric factor for cell constant calculation
 
 # Page configuration
 st.set_page_config(
-    page_title="SDAT The SIP Data Analyzer Tool",
+    page_title="SDAT · SIP Data Analysis Tool",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -60,8 +68,10 @@ class FileFormat(Enum):
 def detect_file_format(lines: list) -> FileFormat:
     """Detect the format of the uploaded file."""
     header_content = '\n'.join(lines[:min(20, len(lines))])
-    
-    if HEADER_MARKER in header_content or 'OE PSIP Measurement' in header_content:
+
+    if (HEADER_MARKER.lower() in header_content.lower()
+            or 'OE PSIP Measurement' in header_content
+            or WRITER_VERSION_PATTERN.search(header_content)):
         logger.info("Detected format: OE PSIP")
         return FileFormat.OE_PSIP
     
@@ -72,51 +82,6 @@ def detect_file_format(lines: list) -> FileFormat:
     logger.warning("Unknown file format")
     return FileFormat.UNKNOWN
 
-
-def find_header_end(lines: list) -> int:
-    """Find the index of the LAST header end marker in the file."""
-    last_marker_idx = -1
-    for i, line in enumerate(lines):
-        if HEADER_MARKER in line:
-            last_marker_idx = i
-    return last_marker_idx
-
-
-def extract_resistor_value(lines: list) -> Tuple[float, bool]:
-    """Extract reference resistor value from file metadata."""
-    for line in lines:
-        if RESISTOR_KEY in line:
-            try:
-                value = float(line.split(',')[1])
-                logger.info(f"Found reference resistor: {value} Ohms")
-                return value, True
-            except (IndexError, ValueError) as e:
-                logger.warning(f"Failed to parse resistor value: {e}")
-    
-    logger.warning(f"Resistor value not found, using default: {DEFAULT_REF_RESISTOR} Ohms")
-    return DEFAULT_REF_RESISTOR, False
-
-
-def build_column_headers(channel_line: str, column_line: str) -> list:
-    """Build combined column headers from channel and column name lines."""
-    channel_tokens = channel_line.strip().split(',')
-    col_tokens = column_line.strip().split(',')
-    
-    max_len = max(len(channel_tokens), len(col_tokens))
-    channel_tokens += [''] * (max_len - len(channel_tokens))
-    col_tokens += [''] * (max_len - len(col_tokens))
-    
-    unique_columns = []
-    for ch, col in zip(channel_tokens, col_tokens):
-        col = col.strip()
-        ch = ch.strip()
-        if ch:
-            unique_columns.append(f"{ch} {col}")
-        else:
-            unique_columns.append(col)
-    
-    unique_columns = [c for c in unique_columns if c]
-    return unique_columns
 
 # ============================================================================
 # SIMPLE TABLE PARSER
@@ -187,6 +152,8 @@ def parse_simple_table(lines: list) -> Tuple[Optional[pd.DataFrame], Optional[fl
             column_mapping[col] = 'Frequency[Hz]'
         elif 'mag' in col_lower and 'ratio' in col_lower:
             column_mapping[col] = 'Chan-1 Magnitude[ratio]'
+        elif 'mag' in col_lower and 'db' in col_lower:
+            column_mapping[col] = 'Chan-1 Magnitude[dB]'
         elif 'phase' in col_lower and 'rad' in col_lower:
             column_mapping[col] = 'Chan-1 Phase_Shift[rad]'
     
@@ -206,11 +173,47 @@ def parse_simple_table(lines: list) -> Tuple[Optional[pd.DataFrame], Optional[fl
 # ============================================================================
 
 def find_header_end(lines: list) -> int:
+    """Find the index of the LAST header end marker (case-insensitive, since
+    LabVIEW writers emit both '***End_Of_Header***' and '***End_of_Header***')."""
+    marker = HEADER_MARKER.lower()
     last_marker_idx = -1
     for i, line in enumerate(lines):
-        if HEADER_MARKER in line:
+        if marker in line.lower():
             last_marker_idx = i
     return last_marker_idx
+
+
+def detect_magnitude_unit(lines: list, columns: list) -> str:
+    """Detect whether the magnitude columns hold a linear ratio or dB.
+
+    The column unit (e.g. 'Magnitude[dB]' vs 'Magnitude[ratio]') takes precedence.
+    Otherwise PSIP files written with 'Writer_Version,2' store magnitude in dB.
+
+    Returns:
+        'dB' or 'ratio'
+    """
+    units = set()
+    for col in columns:
+        match = MAGNITUDE_COL_PATTERN.search(str(col))
+        if match and match.group(1):
+            units.add(match.group(1).lower())
+    if 'db' in units:
+        return 'dB'
+    if 'ratio' in units:
+        return 'ratio'
+
+    header_content = ''.join(lines[:30])
+    if WRITER_VERSION_PATTERN.search(header_content):
+        logger.info("Writer_Version 2 header found: magnitude assumed to be in dB")
+        return 'dB'
+    return 'ratio'
+
+
+def magnitude_to_ratio(magnitude, unit: str):
+    """Convert magnitude values to a linear ratio (dB: ratio = 10^(mag/20))."""
+    if unit == 'dB':
+        return np.power(10.0, magnitude / 20.0)
+    return magnitude
 
 
 def extract_resistor_value(lines: list) -> Tuple[float, bool]:
@@ -277,20 +280,31 @@ def parse_oe_psip_format(lines: list) -> Tuple[Optional[pd.DataFrame], Optional[
     if not resistor_found:
         st.warning(f"Could not find resistor value in file. Using default {DEFAULT_REF_RESISTOR} Ohms")
     
-    # Identify key line positions
-    channel_line_idx = header_end_index + 1
-    col_name_line_idx = header_end_index + 2
-    data_start_idx = header_end_index + 3
-    
+    # Identify key line positions. Multi-channel files have a channel line
+    # followed by a column name line; LabVIEW-style (Writer_Version 2) files put
+    # the column names directly after the marker.
+    first_line_idx = header_end_index + 1
+    if first_line_idx < len(lines) and 'frequency' in lines[first_line_idx].lower():
+        channel_line = ''
+        col_name_line_idx = first_line_idx
+    else:
+        channel_line = lines[first_line_idx] if first_line_idx < len(lines) else ''
+        col_name_line_idx = header_end_index + 2
+    data_start_idx = col_name_line_idx + 1
+
     # Build column headers
-    if channel_line_idx >= len(lines) or col_name_line_idx >= len(lines):
+    if col_name_line_idx >= len(lines):
         st.error("File structure is incomplete. Missing channel or column name lines.")
         return None, None
-    
-    unique_columns = build_column_headers(
-        lines[channel_line_idx],
-        lines[col_name_line_idx]
-    )
+
+    unique_columns = build_column_headers(channel_line, lines[col_name_line_idx])
+    if not channel_line:
+        # Single-channel layout: label measurement columns as Chan-1 so they line
+        # up with multi-channel PSIP files and the simple table format
+        unique_columns = [
+            f"Chan-1 {c}" if ('magnitude' in c.lower() or 'phase' in c.lower()) else c
+            for c in unique_columns
+        ]
     
     # Check data consistency - trim headers if needed
     if data_start_idx < len(lines):
@@ -305,7 +319,9 @@ def parse_oe_psip_format(lines: list) -> Tuple[Optional[pd.DataFrame], Optional[
             unique_columns = unique_columns[:num_data_cols]
     
     # Load data section
-    stringio = io.StringIO('\n'.join(lines))
+    # Lines keep their own line endings; joining with a newline would add blank
+    # lines that skiprows counts, letting header rows leak into the data
+    stringio = io.StringIO(''.join(lines))
     try:
         df = pd.read_csv(
             stringio,
@@ -359,15 +375,16 @@ def validate_dataframe(df: pd.DataFrame) -> bool:
 
 
 @st.cache_data
-def parse_sip_file(uploaded_file) -> Tuple[Optional[pd.DataFrame], Optional[float], Optional[str]]:
+def parse_sip_file(uploaded_file) -> Tuple[Optional[pd.DataFrame], Optional[float], Optional[str], Optional[str]]:
     """Parse SIP file with automatic format detection.
     
     Args:
         uploaded_file: Streamlit uploaded file object
         
     Returns:
-        Tuple of (DataFrame with parsed data, reference resistor value, format type)
-        Returns (None, None, None) if parsing fails
+        Tuple of (DataFrame with parsed data, reference resistor value, format type,
+        magnitude unit 'ratio' or 'dB')
+        Returns (None, None, None, None) if parsing fails
     """
     # Read file content
     try:
@@ -381,13 +398,13 @@ def parse_sip_file(uploaded_file) -> Tuple[Optional[pd.DataFrame], Optional[floa
                 "Try opening it in a text editor to verify the format."
             )
             logger.error(f"File decoding failed: {e}")
-            return None, None, None
+            return None, None, None, None
     
     lines = stringio.readlines()
     
     if not lines:
         st.error("File is empty")
-        return None, None, None
+        return None, None, None, None
     
     # Detect file format
     file_format = detect_file_format(lines)
@@ -405,17 +422,19 @@ def parse_sip_file(uploaded_file) -> Tuple[Optional[pd.DataFrame], Optional[floa
             "- O&E PSIP files (with ***End_Of_Header*** marker)\n"
             "- Simple table files (Freq/Magnitude/Phase columns)"
         )
-        return None, None, None
+        return None, None, None, None
     
     if df is None:
-        return None, None, None
+        return None, None, None, None
     
     # Validate the parsed data
     if not validate_dataframe(df):
-        return None, None, None
+        return None, None, None, None
     
-    logger.info(f"Successfully parsed file as {format_name}")
-    return df, ref_resistor, format_name
+    magnitude_unit = detect_magnitude_unit(lines, df.columns.tolist())
+    
+    logger.info(f"Successfully parsed file as {format_name} (magnitude unit: {magnitude_unit})")
+    return df, ref_resistor, format_name, magnitude_unit
 
 
 # ============================================================================
@@ -426,12 +445,13 @@ def calculate_physics_properties(
     sip_data: pd.DataFrame,
     reference_resistor: float,
     sample_length: float,
-    sample_area: float
+    sample_area: float,
+    magnitude_unit: str = 'ratio'
 ) -> pd.DataFrame:
     """Calculate resistance, resistivity, and conductivity for all channels.
     
     Uses formulas according the Excel worksheet:
-    - Resistance = Magnitude × Reference Resistor
+    - Resistance = Magnitude × Reference Resistor (dB magnitudes: R_ref × 10^(mag/20))
     - Resistivity = (Resistance × Area) / Length
     - Fluid Conductivity = (1 / Resistivity) × 10000 (μS/cm)
     - Real Conductivity = (1 / Resistivity) × cos(Phase) (S/m)
@@ -444,16 +464,17 @@ def calculate_physics_properties(
         reference_resistor: Reference resistor value in Ohms
         sample_length: Sample length in meters
         sample_area: Sample cross-sectional area in square meters
+        magnitude_unit: 'ratio' or 'dB'; applies to every magnitude column
         
     Returns:
         DataFrame with calculated properties added
     """
     # Find all Magnitude columns to calculate physics for each channel
-    magnitude_columns = [c for c in sip_data.columns if 'Magnitude[ratio]' in c]
+    magnitude_columns = [c for c in sip_data.columns if MAGNITUDE_COL_PATTERN.search(c)]
     
     if not magnitude_columns:
         logger.warning("No magnitude columns found for calculations")
-        st.info("No Magnitude[ratio] columns found. Skipping physics calculations. "
+        st.info("No Magnitude[ratio] or Magnitude[dB] columns found. Skipping physics calculations. "
                "The file may only contain frequency sweep data.")
         return sip_data
     
@@ -461,23 +482,26 @@ def calculate_physics_properties(
     
     
     for mag_col in magnitude_columns:
-        # Extract prefix (e.g., "Chan-1")
-        prefix = mag_col.replace(' Magnitude[ratio]', '')
+        # Extract prefix (e.g., "Chan-1"); empty for single-channel files
+        prefix = mag_col[:MAGNITUDE_COL_PATTERN.search(mag_col).start()].strip()
+        
+        def chan_col(name: str) -> str:
+            return f"{prefix} {name}" if prefix else name
         
         # Find corresponding Phase column
-        phase_col = f"{prefix} Phase_Shift[rad]"
+        phase_col = chan_col("Phase_Shift[rad]")
         has_phase = phase_col in sip_data.columns
         
-        # D: Resistance (Ω) = Magnitude × Reference Resistor
-        resistance_col = f"{prefix} Resistance (Ohms)"
-        sip_data[resistance_col] = sip_data[mag_col] * reference_resistor
+        # D: Resistance (Ω) = Magnitude (as ratio) × Reference Resistor
+        resistance_col = chan_col("Resistance (Ohms)")
+        sip_data[resistance_col] = magnitude_to_ratio(sip_data[mag_col], magnitude_unit) * reference_resistor
         
         # E: Resistivity (Ω·m) = (Resistance × Area) / Length
-        resistivity_col = f"{prefix} Resistivity (Ohm-m)"
+        resistivity_col = chan_col("Resistivity (Ohm-m)")
         sip_data[resistivity_col] = (sip_data[resistance_col] * sample_area) / sample_length
         
         # F: Fluid Conductivity (μS/cm) = (1 / Resistivity) × 10000
-        fluid_cond_col = f"{prefix} Fluid Conductivity (uS/cm)"
+        fluid_cond_col = chan_col("Fluid Conductivity (uS/cm)")
         sip_data[fluid_cond_col] = np.where(
             sip_data[resistivity_col] > MIN_RESISTIVITY_THRESHOLD,
             (1 / sip_data[resistivity_col]) * 10000,
@@ -485,7 +509,7 @@ def calculate_physics_properties(
         )
         
         # J: Cell Constant K = 1,000,000 × 0.1606 / Resistance
-        k_col = f"{prefix} Cell Constant K"
+        k_col = chan_col("Cell Constant K")
         sip_data[k_col] = np.where(
             sip_data[resistance_col] > 1e-10,
             1000000 * CELL_CONSTANT_FACTOR / sip_data[resistance_col],
@@ -495,11 +519,11 @@ def calculate_physics_properties(
         # Phase-dependent calculations (only if phase data available)
         if has_phase:
             # G: Phase in milliradians = -Phase × 1000
-            phase_mrad_col = f"{prefix} Phase (mRads)"
+            phase_mrad_col = chan_col("Phase (mRads)")
             sip_data[phase_mrad_col] = -sip_data[phase_col] * 1000
             
             # H: Imaginary Conductivity (S/m) = -(1 / Resistivity) × sin(Phase)
-            imag_cond_col = f"{prefix} Imaginary Conductivity (S/m)"
+            imag_cond_col = chan_col("Imaginary Conductivity (S/m)")
             sip_data[imag_cond_col] = np.where(
                 sip_data[resistivity_col] > MIN_RESISTIVITY_THRESHOLD,
                 -(1 / sip_data[resistivity_col]) * np.sin(sip_data[phase_col]),
@@ -507,7 +531,7 @@ def calculate_physics_properties(
             )
             
             # I: Real Conductivity (S/m) = (1 / Resistivity) × cos(Phase)
-            real_cond_col = f"{prefix} Real Conductivity (S/m)"
+            real_cond_col = chan_col("Real Conductivity (S/m)")
             sip_data[real_cond_col] = np.where(
                 sip_data[resistivity_col] > MIN_RESISTIVITY_THRESHOLD,
                 (1 / sip_data[resistivity_col]) * np.cos(sip_data[phase_col]),
@@ -515,10 +539,84 @@ def calculate_physics_properties(
             )
             
             # K: Imaginary Conductivity in μS/cm = Imaginary Conductivity × 10000
-            imag_cond_uscm_col = f"{prefix} Imaginary Conductivity (uS/cm)"
+            imag_cond_uscm_col = chan_col("Imaginary Conductivity (uS/cm)")
             sip_data[imag_cond_uscm_col] = sip_data[imag_cond_col] * 10000
     
     return sip_data
+# ============================================================================
+# SAMPLE GEOMETRY
+# ============================================================================
+
+def area_from_diameter(diameter: float) -> float:
+    """Cross-sectional area (m²) of a cylindrical holder: π(d/2)²."""
+    return float(np.pi * (diameter / 2) ** 2)
+
+
+def get_per_file_geometry_ui(file_names: List[str], default_length: float,
+                             default_area: float, default_diameter: Optional[float]
+                             ) -> Dict[str, Dict[str, Optional[float]]]:
+    """Editable per-file geometry table, pre-filled from the global sample properties.
+
+    Args:
+        file_names: Uploaded file names
+        default_length: Global sample length (m)
+        default_area: Global sample area (m²)
+        default_diameter: Global diameter (m) when diameter input is used, else None
+
+    Returns:
+        Dictionary mapping file name to {'length', 'area', 'diameter'}
+    """
+    use_diameter = default_diameter is not None
+    size_col = "Diameter (m)" if use_diameter else "Area (m²)"
+    geometry_df = pd.DataFrame({
+        "File": file_names,
+        "Length (m)": [default_length] * len(file_names),
+        size_col: [default_diameter if use_diameter else default_area] * len(file_names),
+    })
+    edited = st.data_editor(
+        geometry_df,
+        hide_index=True,
+        disabled=["File"],
+        use_container_width=True,
+        key=f"geometry_editor_{size_col}",
+        column_config={
+            "Length (m)": st.column_config.NumberColumn(
+                min_value=0.0, format="%.4f", step=0.0001,
+                help="Distance between the potential electrodes for this file"),
+            size_col: st.column_config.NumberColumn(
+                min_value=0.0, format="%.4f" if use_diameter else "%.6f",
+                step=0.0001 if use_diameter else 0.000001,
+                help="Holder inner diameter (A = π(d/2)²)" if use_diameter else "Sample cross-sectional area"
+            ),
+        }
+    )
+    
+    geometry = {}
+    for _, row in edited.iterrows():
+        length = row["Length (m)"]
+        size = row[size_col]
+        if pd.isna(length) or pd.isna(size) or length <= 0 or size <= 0:
+            st.warning(f"Invalid geometry for {row['File']}; using the global values.")
+            length = default_length
+            size = default_diameter if use_diameter else default_area
+        geometry[row["File"]] = {
+            'length': float(length),
+            'area': area_from_diameter(size) if use_diameter else float(size),
+            'diameter': float(size) if use_diameter else None,
+        }
+    return geometry
+
+
+def with_geometry_columns(df: pd.DataFrame, geometry: Dict[str, Optional[float]]) -> pd.DataFrame:
+    """Return a copy of df with the sample geometry used for it, for CSV export."""
+    df = df.copy()
+    df['Sample Length (m)'] = geometry['length']
+    df['Sample Area (m²)'] = geometry['area']
+    if geometry.get('diameter') is not None:
+        df['Sample Diameter (m)'] = geometry['diameter']
+    return df
+
+
 # ============================================================================
 #COMPARISON PLOT BUILDER
 # ============================================================================
@@ -552,7 +650,8 @@ def create_comparison_plot(datasets: Dict[str, pd.DataFrame], x_col: str, y_col:
                         loop_data = df[df['Loop'] == loop]
                         fig.add_trace(go.Scatter(
                             x=loop_data[x_col], y=loop_data[y_col],
-                            mode='lines+markers', name=f"{name} - L{loop}",
+                            mode='lines+markers',
+                            name=f"Loop {loop}" if len(datasets) == 1 else f"{name} - L{loop}",
                             line=dict(color=line_color), marker=dict(size=6)
                         ))
                 else:
@@ -611,12 +710,734 @@ def create_comparison_plot(datasets: Dict[str, pd.DataFrame], x_col: str, y_col:
     )
     return fig
 # ============================================================================
-#PLOT CONFIGURATION HELPER
+# SIP TWO-PANEL PLOT (phase over magnitude/conductivity)
 # ============================================================================
-def get_plot_config():
-    """Return Plotly config wit editability enabled."""
+PHASE_QUANTITY = 'Phase (mRads)'
+SIP_BOTTOM_QUANTITIES = [
+    'Resistivity (Ohm-m)',
+    'Fluid Conductivity (uS/cm)',
+    'Real Conductivity (S/m)',
+    'Imaginary Conductivity (S/m)',
+    'Imaginary Conductivity (uS/cm)',
+    'Resistance (Ohms)',
+]
+
+
+# Display names and symbols for the data columns (the columns themselves keep their names)
+QUANTITY_LABELS = {
+    'Frequency[Hz]': ('Frequency', 'f (Hz)'),
+    'Magnitude[ratio]': ('Impedance ratio', '|Z|/R_ref'),
+    'Magnitude[dB]': ('Impedance ratio', '|Z|/R_ref (dB)'),
+    'Magnitude': ('Impedance ratio', '|Z|/R_ref'),
+    'Phase_Shift[rad]': ('Phase shift', 'φ (rad)'),
+    'Resistance (Ohms)': ('Resistance', '|R| (Ω)'),
+    'Resistivity (Ohm-m)': ('Resistivity', '|ρ| (Ω·m)'),
+    'Fluid Conductivity (uS/cm)': ('Conductivity', 'σ (µS/cm)'),
+    'Cell Constant K': ('Cell constant', 'K'),
+    'Phase (mRads)': ('Phase', '−φ (mrad)'),
+    'Real Conductivity (S/m)': ('Real conductivity', "σ′ (S/m)"),
+    'Imaginary Conductivity (S/m)': ('Imaginary conductivity', "σ″ (S/m)"),
+    'Imaginary Conductivity (uS/cm)': ('Imaginary conductivity', "σ″ (µS/cm)"),
+}
+CHANNEL_PATTERN = re.compile(r'^(Chan-\d+)\s+(.+)$')
+
+
+def split_channel(column: str) -> Tuple[str, str]:
+    """Split 'Chan-1 Resistivity (Ohm-m)' into ('Chan-1', 'Resistivity (Ohm-m)')."""
+    match = CHANNEL_PATTERN.match(str(column))
+    return (match.group(1), match.group(2)) if match else ('', str(column))
+
+
+def display_name(column: str) -> str:
+    """Selector label, e.g. 'Chan-1 · Resistivity |ρ| (Ω·m)'; unknown columns are unchanged."""
+    channel, quantity = split_channel(column)
+    if quantity not in QUANTITY_LABELS:
+        return str(column)
+    name, symbol = QUANTITY_LABELS[quantity]
+    label = f"{name} {symbol}"
+    return f"{channel} · {label}" if channel else label
+
+
+def axis_label(column: str) -> str:
+    """Axis label with symbol and unit, e.g. '|ρ| (Ω·m)'; unknown columns are unchanged."""
+    _, quantity = split_channel(column)
+    return QUANTITY_LABELS[quantity][1] if quantity in QUANTITY_LABELS else str(column)
+
+
+def channel_column(channel: str, quantity: str) -> str:
+    """Column name for a channel quantity, e.g. ('Chan-1', 'Phase (mRads)')."""
+    return f"{channel} {quantity}" if channel else quantity
+
+
+def get_phase_channels(columns: List[str]) -> List[str]:
+    """Channel prefixes that have a calculated phase column (e.g. ['Chan-1', 'Chan-2'])."""
+    return [c[:-len(PHASE_QUANTITY)].strip() for c in columns if str(c).endswith(PHASE_QUANTITY)]
+
+
+def find_frequency_column(columns: List[str]) -> Optional[str]:
+    """Return the frequency column name, if any."""
+    return next((c for c in columns if 'frequency' in str(c).lower()), None)
+
+
+def iter_loop_traces(datasets: Dict[str, pd.DataFrame], selected_loops: Dict[str, List[str]] = None):
+    """Yield (trace_name, dataframe) per file and loop, honouring the loop selection."""
+    for name, df in datasets.items():
+        if selected_loops and selected_loops.get(name) and 'Loop' in df.columns:
+            df = df[df['Loop'].isin(selected_loops[name])]
+        if df.empty:
+            continue
+        if 'Loop' in df.columns and len(df['Loop'].unique()) > 1:
+            for loop in sorted(df['Loop'].unique()):
+                trace_name = f"Loop {loop}" if len(datasets) == 1 else f"{name} - L{loop}"
+                yield trace_name, df[df['Loop'] == loop]
+        else:
+            yield name, df
+
+
+def create_sip_two_panel_plot(datasets: Dict[str, pd.DataFrame], channel: str,
+                              bottom_quantity: str, freq_col: str,
+                              log_x: bool = True, log_y_bottom: bool = False,
+                              selected_loops: Dict[str, List[str]] = None,
+                              title: str = None, x_label: str = None,
+                              top_label: str = None, bottom_label: str = None) -> go.Figure:
+    """Standard SIP figure: phase on top, magnitude/conductivity below, shared log-frequency axis."""
+    phase_col = channel_column(channel, PHASE_QUANTITY)
+    bottom_col = channel_column(channel, bottom_quantity)
+    
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06)
+    palette = COLORBLIND_SAFE_PALETTE
+    datasets = {name: df for name, df in datasets.items()
+                if {freq_col, phase_col, bottom_col}.issubset(df.columns)}
+    for idx, (trace_name, df) in enumerate(iter_loop_traces(datasets, selected_loops)):
+        df = df.sort_values(freq_col)
+        color = palette[idx % len(palette)]
+        common = dict(
+            x=df[freq_col], mode='lines+markers', name=trace_name, legendgroup=trace_name,
+            line=dict(color=color), marker=dict(size=6, color=color)
+        )
+        fig.add_trace(go.Scatter(y=df[phase_col], showlegend=True, **common), row=1, col=1)
+        fig.add_trace(go.Scatter(y=df[bottom_col], showlegend=False, **common), row=2, col=1)
+    
+    fig.update_xaxes(type='log' if log_x else 'linear')
+    fig.update_xaxes(title_text=x_label or axis_label(freq_col), row=2, col=1)
+    fig.update_yaxes(title_text=top_label or axis_label(phase_col), row=1, col=1)
+    fig.update_yaxes(title_text=bottom_label or axis_label(bottom_col),
+                     type='log' if log_y_bottom else 'linear', row=2, col=1)
+    fig.update_layout(
+        title=dict(text=title if title is not None else f"{channel} SIP spectrum".strip(),
+                   x=0.5, xanchor='center', font=dict(size=16)),
+        height=750, hovermode='closest'
+    )
+    return fig
+
+
+def get_two_panel_settings_ui(columns: List[str], key_prefix: str = "") -> Optional[Dict[str, str]]:
+    """Channel and bottom-panel selection for the two-panel plot. None when no phase data exists."""
+    channels = get_phase_channels(columns)
+    if not channels:
+        st.warning("No phase data available for a two-panel SIP plot.")
+        return None
+    channel = st.selectbox("Channel", options=channels, key=f"{key_prefix}_tp_channel",
+                           help="Measurement channel (potential electrode pair) of the PSIP instrument")
+    quantities = [q for q in SIP_BOTTOM_QUANTITIES if channel_column(channel, q) in columns]
+    bottom_quantity = st.selectbox(
+        "Lower panel", options=quantities, key=f"{key_prefix}_tp_bottom",
+        format_func=display_name,
+        help="Quantity plotted below the phase. |ρ|: resistivity magnitude = |R|·A/L. "
+             "σ: conductivity 1/|ρ|. σ′ = cos φ/|ρ|: conduction (in-phase). "
+             "σ″ = −sin φ/|ρ|: polarization (quadrature). |R|: measured resistance."
+    )
     return {
-        'editable': True,
+        'channel': channel,
+        'bottom_quantity': bottom_quantity,
+        'freq_col': find_frequency_column(columns),
+    }
+
+
+def get_labels_ui(defaults: Dict[str, str], key_prefix: str) -> Dict[str, str]:
+    """Editable figure title and axis labels.
+
+    Args:
+        defaults: Mapping of field -> default text, e.g. {'Title': ..., 'X axis': ...}
+    """
+    # Keys include the default so labels follow changes of the plotted quantity
+    return {
+        field: st.text_input(field, value=default, key=f"{key_prefix}_label_{field}_{default}")
+        for field, default in defaults.items()
+    }
+
+
+# ============================================================================
+# FLUID CALIBRATION CHECK
+# ============================================================================
+
+def theoretical_fluid_phase_mrad(freq, sigma_uscm: float,
+                                 eps_r: float = WATER_RELATIVE_PERMITTIVITY) -> np.ndarray:
+    """Theoretical phase of a fluid with conductivity σ and permittivity ε_r·ε0.
+
+    φ(ω) = arctan(ε_r·ε0·ω / σ), returned in mrad and positive for a capacitive
+    response, matching SDAT's 'Phase (mRads)' = -Phase_Shift × 1000.
+
+    Args:
+        freq: Frequencies in Hz
+        sigma_uscm: Fluid conductivity in µS/cm
+        eps_r: Relative permittivity of the fluid (water ≈ 81)
+    """
+    sigma = sigma_uscm * 1e-4  # µS/cm -> S/m
+    omega = 2 * np.pi * np.asarray(freq, dtype=float)
+    return 1000 * np.arctan(eps_r * VACUUM_PERMITTIVITY * omega / sigma)
+
+
+def fluid_phase_deviation(freq, phase_mrad, sigma_uscm: float, eps_r: float,
+                          tolerance_mrad: float) -> Dict[str, float]:
+    """RMS / max deviation of a measured phase spectrum from the theoretical fluid phase."""
+    freq = np.asarray(freq, dtype=float)
+    phase_mrad = np.asarray(phase_mrad, dtype=float)
+    valid = np.isfinite(freq) & np.isfinite(phase_mrad)
+    deviation = phase_mrad[valid] - theoretical_fluid_phase_mrad(freq[valid], sigma_uscm, eps_r)
+    if deviation.size == 0:
+        return {'RMS deviation (mrad)': np.nan, 'Max |deviation| (mrad)': np.nan, 'Within tolerance (%)': np.nan}
+    return {
+        'RMS deviation (mrad)': float(np.sqrt(np.mean(deviation ** 2))),
+        'Max |deviation| (mrad)': float(np.max(np.abs(deviation))),
+        'Within tolerance (%)': float(100 * np.mean(np.abs(deviation) <= tolerance_mrad)),
+    }
+
+
+def measured_low_frequency_conductivity(df: pd.DataFrame, channel: str, freq_col: str) -> float:
+    """Mean measured fluid conductivity (µS/cm) at the lowest frequency, or NaN."""
+    cond_col = channel_column(channel, 'Fluid Conductivity (uS/cm)')
+    if df.empty or cond_col not in df.columns or freq_col not in df.columns:
+        return np.nan
+    lowest = df[df[freq_col] == df[freq_col].min()]
+    return float(lowest[cond_col].mean())
+
+
+def add_fluid_phase_overlay(fig: go.Figure, freq_min: float, freq_max: float,
+                            sigma_uscm: float, eps_r: float, tolerance_mrad: float,
+                            rows: Optional[List[int]] = None) -> go.Figure:
+    """Overlay the theoretical fluid phase curve and its ± tolerance band.
+
+    Args:
+        rows: Subplot rows holding a phase axis; None for a single-axis figure
+    """
+    freq = np.logspace(np.log10(freq_min), np.log10(freq_max), 200)
+    theory = theoretical_fluid_phase_mrad(freq, sigma_uscm, eps_r)
+    for idx, row in enumerate(rows or [None]):
+        position = dict(row=row, col=1) if row else {}
+        show = idx == 0
+        fig.add_trace(go.Scatter(
+            x=freq, y=theory + tolerance_mrad, mode='lines', line=dict(width=0),
+            name='Fluid tolerance band', legendgroup='fluid_theory', showlegend=False, hoverinfo='skip'
+        ), **position)
+        fig.add_trace(go.Scatter(
+            x=freq, y=theory - tolerance_mrad, mode='lines', line=dict(width=0),
+            fill='tonexty', fillcolor='rgba(150,150,150,0.3)',
+            name=f'± {tolerance_mrad:g} mrad tolerance', legendgroup='fluid_theory', showlegend=show,
+            hoverinfo='skip'
+        ), **position)
+        fig.add_trace(go.Scatter(
+            x=freq, y=theory, mode='lines', line=dict(color='#E45756', width=2, dash='dash'),
+            name=f'Theoretical fluid phase ({sigma_uscm:g} µS/cm)', legendgroup='fluid_theory',
+            showlegend=show
+        ), **position)
+    return fig
+
+
+def get_fluid_calibration_ui(phase_channel: Optional[str], default_sigma_uscm: float,
+                             key_suffix: str) -> Optional[Dict[str, float]]:
+    """Controls for the fluid calibration check. Returns settings when enabled."""
+    st.caption("For calibration/QC measurements on water: φ(ω) = arctan(ε_r·ε0·ω/σ)")
+    enabled = st.checkbox(
+        "Overlay theoretical fluid phase", key="fluid_check_enabled",
+        help="A water sample does not polarize: its phase comes only from the dielectric "
+             "displacement current, φ = arctan(ε_r·ε0·ω/σ), which grows with frequency. Measured "
+             "phases outside the band point to instrument, electrode or cable errors."
+    )
+    if not enabled:
+        return None
+    if phase_channel is None:
+        st.info("Plot phase −φ (mrad) against frequency, or use the SIP two-panel plot, "
+                "to see the overlay.")
+        return None
+    if not np.isfinite(default_sigma_uscm) or default_sigma_uscm <= 0:
+        default_sigma_uscm = 1000.0
+    sigma = st.number_input(
+        "Fluid conductivity σ (µS/cm)", min_value=0.001, value=float(round(default_sigma_uscm, 2)),
+        format="%.2f", key=f"fluid_sigma_{key_suffix}",
+        help="Defaults to the measured low-frequency conductivity of the plotted channel"
+    )
+    eps_r = st.number_input("Relative permittivity ε_r", min_value=1.0,
+                            value=WATER_RELATIVE_PERMITTIVITY, key="fluid_eps_r",
+                            help="Relative dielectric permittivity of the fluid; water ≈ 80 at room temperature")
+    tolerance = st.number_input("Tolerance band (± mrad)", min_value=0.0,
+                                value=DEFAULT_FLUID_TOLERANCE_MRAD, step=0.01,
+                                format="%.3f", key="fluid_tolerance",
+                                help="Accepted deviation of the measured phase from theory, shown as the "
+                                     "grey band and used for the 'within tolerance' percentage")
+    return {'sigma': sigma, 'eps_r': eps_r, 'tolerance': tolerance, 'channel': phase_channel}
+
+
+def number_column_config(columns, exclude=(), fmt: str = "%.4g") -> Dict:
+    """st.dataframe column_config showing numbers to 4 significant figures (with header help)."""
+    return {c: st.column_config.NumberColumn(format=fmt, help=COLUMN_HELP.get(c))
+            for c in columns if c not in exclude}
+
+
+def show_fluid_deviation_table(datasets: Dict[str, pd.DataFrame], freq_col: str,
+                               fluid: Dict[str, float],
+                               selected_loops: Dict[str, List[str]] = None):
+    """Show the RMS deviation of each plotted phase spectrum from the theoretical curve."""
+    phase_col = channel_column(fluid['channel'], PHASE_QUANTITY)
+    rows = []
+    for trace_name, df in iter_loop_traces(datasets, selected_loops):
+        if phase_col in df.columns and freq_col in df.columns:
+            rows.append({'Spectrum': trace_name, **fluid_phase_deviation(
+                df[freq_col], df[phase_col], fluid['sigma'], fluid['eps_r'], fluid['tolerance']
+            )})
+    if rows:
+        st.markdown(f"**Fluid calibration check**: {display_name(phase_col)} against theory for "
+                    f"σ = {fluid['sigma']:g} µS/cm, ε_r = {fluid['eps_r']:g}")
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True,
+                     column_config=number_column_config(rows[0], exclude=['Spectrum']))
+
+
+# Explanations shown as "?" tooltips on table headers and metrics
+DD_PARAMETER_HELP = {
+    'rho0 (Ohm-m)': "ρ0: DC resistivity, the model value for ω → 0",
+    'm_tot': "Total chargeability Σ m_k: strength of the polarization relative to ρ0",
+    'm_tot_n (S/m)': "Normalized chargeability m_tot/ρ0: polarization independent of the bulk "
+                     "resistivity, linked to the specific surface area",
+    'tau_mean (s)': "Mean relaxation time, the chargeability-weighted mean of log τ",
+    'tau_10 (s)': "τ at which the cumulative chargeability reaches 10 %",
+    'tau_50 (s)': "Median relaxation time: half of m_tot lies below this τ. Larger τ points to "
+                  "larger grains or pores",
+    'tau_60 (s)': "τ at which the cumulative chargeability reaches 60 %",
+    'U_tau': "Uniformity τ60/τ10: width of the relaxation-time distribution (1 = single time)",
+    'tau_peak1 (s)': "Relaxation time of the largest-τ (lowest-frequency) peak of m(τ)",
+    'tau_peaks (s)': "Relaxation times of all peaks of m(τ), largest τ first",
+    'n_peaks': "Number of peaks in m(τ)",
+    'RMS |rho| misfit (%)': "Root-mean-square relative misfit of the fitted |ρ|",
+    'RMS phase misfit (mrad)': "Root-mean-square misfit of the fitted phase",
+    'lambda': "Regularization strength used for this spectrum",
+    'f_min (Hz)': "Lowest frequency used in the fit",
+    'f_max (Hz)': "Highest frequency used in the fit",
+    'n_freqs': "Number of frequencies used in the fit",
+}
+COLUMN_HELP = {
+    **DD_PARAMETER_HELP,
+    'R_ref (Ω)': "Reference resistor used to convert the magnitude ratio |Z|/R_ref to resistance",
+    'L (m)': "Sample length used for this file",
+    'A (m²)': "Sample cross-sectional area used for this file",
+    'RMS deviation (mrad)': "Root-mean-square difference between measured and theoretical phase",
+    'Max |deviation| (mrad)': "Largest absolute difference between measured and theoretical phase",
+    'Within tolerance (%)': "Share of frequencies whose phase lies inside the tolerance band",
+}
+
+
+# ============================================================================
+# DEBYE DECOMPOSITION
+# ============================================================================
+# Lightweight Debye decomposition (DD) written from the published equations
+# (Nordsiek & Weller 2008; Weigand & Kemna 2016), not from the GPL DD tools:
+#
+#   ρ(ω) = ρ0 · [1 − Σ_k m_k · (1 − 1/(1 + iωτ_k))]
+#
+# With g_k = ρ0·m_k the model is linear in (ρ0, g):  ρ(ω) = ρ0 − Σ_k g_k · K_k(ω),
+# K_k(ω) = iωτ_k / (1 + iωτ_k). The real and imaginary parts are fitted together by
+# a smoothness-regularised non-negative least-squares solve; the regularisation
+# strength λ is picked automatically by a discrepancy criterion unless given.
+DD_TAU_PER_DECADE = 10
+DD_TAU_EXTENSION_DECADES = 1.0
+DD_MAGNITUDE_ERROR = 1e-3   # assumed relative error of |ρ| (0.1 %)
+DD_PHASE_ERROR = 1e-4       # assumed phase error in rad (0.1 mrad)
+DD_LAMBDAS = np.logspace(-2, 10, 49)
+
+
+def dd_tau_grid(freq, tau_per_decade: int = DD_TAU_PER_DECADE,
+                extension_decades: float = DD_TAU_EXTENSION_DECADES) -> np.ndarray:
+    """Log-spaced τ grid covering 1/(2πf) for the measured frequencies, extended on both sides."""
+    freq = np.asarray(freq, dtype=float)
+    log_tau_min = np.log10(1 / (2 * np.pi * freq.max())) - extension_decades
+    log_tau_max = np.log10(1 / (2 * np.pi * freq.min())) + extension_decades
+    n_tau = int(np.ceil((log_tau_max - log_tau_min) * tau_per_decade)) + 1
+    return np.logspace(log_tau_min, log_tau_max, n_tau)
+
+
+def dd_forward(freq, rho0: float, m, tau) -> np.ndarray:
+    """Complex resistivity of the Debye decomposition model."""
+    wt = 2 * np.pi * np.asarray(freq, dtype=float)[:, None] * np.asarray(tau)[None, :]
+    return rho0 * (1 - np.sum(np.asarray(m)[None, :] * (1 - 1 / (1 + 1j * wt)), axis=1))
+
+
+def _dd_solve(design: np.ndarray, data: np.ndarray, smoothing: np.ndarray, lam: float):
+    """Regularised NNLS: min ||A x − d||² + λ ||L x||², x ≥ 0."""
+    a = np.vstack([design, np.sqrt(lam) * smoothing])
+    b = np.concatenate([data, np.zeros(smoothing.shape[0])])
+    x, _ = optimize.nnls(a, b, maxiter=50 * a.shape[1])
+    chi2 = float(np.sum((design @ x - data) ** 2))
+    return x, chi2
+
+
+def dd_integral_parameters(tau, m, rho0: float) -> Dict[str, float]:
+    """Integral parameters of a relaxation-time distribution m(τ).
+
+    m_tot = Σ m_k, m_tot_n = m_tot/ρ0, τ_mean = 10^(Σ m_k log10 τ_k / m_tot),
+    τ_x = τ where the cumulative chargeability reaches x %, U_tau = τ_60/τ_10,
+    τ_peak = local maxima of m(τ), listed from the largest τ (lowest frequency) down.
+    """
+    tau = np.asarray(tau, dtype=float)
+    m = np.asarray(m, dtype=float)
+    m_tot = float(np.sum(m))
+    params = {'rho0 (Ohm-m)': rho0, 'm_tot': m_tot,
+              'm_tot_n (S/m)': m_tot / rho0 if rho0 > 0 else np.nan}
+    if m_tot <= 0:
+        return {**params, 'tau_mean (s)': np.nan, 'tau_10 (s)': np.nan, 'tau_50 (s)': np.nan,
+                'tau_60 (s)': np.nan, 'U_tau': np.nan, 'tau_peak1 (s)': np.nan,
+                'tau_peaks (s)': '', 'n_peaks': 0}
+    log_tau = np.log10(tau)
+    cumulative = np.cumsum(m) / m_tot
+
+    def tau_x(fraction):
+        # First τ where the cumulative chargeability reaches the fraction (log-interpolated)
+        idx = int(np.searchsorted(cumulative, fraction))
+        if idx == 0:
+            return float(tau[0])
+        c0, c1 = cumulative[idx - 1], cumulative[idx]
+        w = (fraction - c0) / (c1 - c0) if c1 > c0 else 0.0
+        return float(10 ** (log_tau[idx - 1] + w * (log_tau[idx] - log_tau[idx - 1])))
+
+    padded = np.concatenate([[0.0], m, [0.0]])
+    peak_idx, _ = signal.find_peaks(padded, prominence=0.1 * m.max())
+    peaks = sorted(tau[peak_idx - 1], reverse=True)
+    tau_10, tau_60 = tau_x(0.10), tau_x(0.60)
+    return {
+        **params,
+        'tau_mean (s)': float(10 ** (np.sum(m * log_tau) / m_tot)),
+        'tau_10 (s)': tau_10,
+        'tau_50 (s)': tau_x(0.50),
+        'tau_60 (s)': tau_60,
+        'U_tau': tau_60 / tau_10,
+        'tau_peak1 (s)': float(peaks[0]) if peaks else np.nan,
+        'tau_peaks (s)': '; '.join(f"{p:.4g}" for p in peaks),
+        'n_peaks': len(peaks),
+    }
+
+
+def debye_decomposition(freq, rho_magnitude, phase_rad, lam: Optional[float] = None,
+                        tau_per_decade: int = DD_TAU_PER_DECADE,
+                        magnitude_error: float = DD_MAGNITUDE_ERROR,
+                        phase_error: float = DD_PHASE_ERROR) -> Dict:
+    """Fit a Debye decomposition to one complex resistivity spectrum.
+
+    Args:
+        freq: Frequencies (Hz)
+        rho_magnitude: |ρ| (Ohm-m)
+        phase_rad: Raw phase shift in rad (negative for a capacitive response,
+            i.e. PSIP 'Phase_Shift[rad]' = −Phase (mRads)/1000)
+        lam: Regularisation strength; None picks it automatically
+        tau_per_decade: τ grid density
+        magnitude_error: Assumed relative error of |ρ|, weights the real part
+        phase_error: Assumed phase error (rad), weights the imaginary part
+
+    Returns:
+        Dictionary with tau, m, rho0, lambda, fitted spectrum, misfit and integral parameters
+    """
+    freq = np.asarray(freq, dtype=float)
+    rho_magnitude = np.asarray(rho_magnitude, dtype=float)
+    phase_rad = np.asarray(phase_rad, dtype=float)
+    valid = (np.isfinite(freq) & np.isfinite(rho_magnitude) & np.isfinite(phase_rad)
+             & (freq > 0) & (rho_magnitude > 0))
+    order = np.argsort(freq[valid])
+    freq, rho_magnitude, phase_rad = (a[valid][order] for a in (freq, rho_magnitude, phase_rad))
+    if freq.size < 3:
+        raise ValueError("At least 3 frequencies are needed for a Debye decomposition")
+
+    tau = dd_tau_grid(freq, tau_per_decade)
+    scale = rho_magnitude[0]  # ≈ ρ0, keeps the unknowns of order one
+    rho = rho_magnitude * np.exp(1j * phase_rad) / scale
+
+    wt = 2 * np.pi * freq[:, None] * tau[None, :]
+    kernel = 1j * wt / (1 + 1j * wt)
+    model = np.hstack([np.ones((freq.size, 1)), -kernel])  # unknowns: [ρ0, g_1..g_n] / scale
+    sigma_re = magnitude_error * rho_magnitude / scale
+    sigma_im = phase_error * rho_magnitude / scale
+    design = np.vstack([model.real / sigma_re[:, None], model.imag / sigma_im[:, None]])
+    data = np.concatenate([rho.real / sigma_re, rho.imag / sigma_im])
+
+    # First-difference smoothing of the chargeabilities (ρ0 is not regularised)
+    smoothing = np.zeros((tau.size - 1, tau.size + 1))
+    idx = np.arange(tau.size - 1)
+    smoothing[idx, idx + 1] = -1.0
+    smoothing[idx, idx + 2] = 1.0
+
+    if lam is None:
+        # Discrepancy principle: the smoothest model whose misfit matches the assumed
+        # errors (χ² ≈ number of data), or stays close to the best achievable misfit
+        fits = [(l, *_dd_solve(design, data, smoothing, l)) for l in DD_LAMBDAS]
+        chi2_min = min(f[2] for f in fits)
+        target = max(data.size, 1.2 * chi2_min)
+        lam, x, chi2 = max((f for f in fits if f[2] <= target), key=lambda f: f[0])
+    else:
+        x, chi2 = _dd_solve(design, data, smoothing, lam)
+
+    rho0 = float(x[0] * scale)
+    m = x[1:] * scale / rho0 if rho0 > 0 else np.zeros(tau.size)
+    fitted = dd_forward(freq, rho0, m, tau)
+    rms_magnitude = float(np.sqrt(np.mean((np.abs(fitted) / rho_magnitude - 1) ** 2)) * 100)
+    rms_phase = float(np.sqrt(np.mean((np.angle(fitted) - phase_rad) ** 2)) * 1000)
+    return {
+        'tau': tau,
+        'm': m,
+        'rho0': rho0,
+        'lambda': float(lam),
+        'chi2': chi2,
+        'freq': freq,
+        'rho_magnitude': rho_magnitude,
+        'phase_rad': phase_rad,
+        'fitted': fitted,
+        'parameters': {
+            **dd_integral_parameters(tau, m, rho0),
+            'RMS |rho| misfit (%)': rms_magnitude,
+            'RMS phase misfit (mrad)': rms_phase,
+            'lambda': float(lam),
+            'f_min (Hz)': float(freq.min()),
+            'f_max (Hz)': float(freq.max()),
+            'n_freqs': int(freq.size),
+        },
+    }
+
+
+@st.cache_data(show_spinner=False)
+def fit_debye_decomposition(df: pd.DataFrame, channel: str, f_min: Optional[float] = None,
+                            f_max: Optional[float] = None, lam: Optional[float] = None,
+                            tau_per_decade: int = DD_TAU_PER_DECADE) -> Dict[str, Dict]:
+    """Run the Debye decomposition on every loop of one channel.
+
+    Uses the geometry-corrected resistivity magnitude and the raw phase shift.
+
+    Returns:
+        Dictionary mapping loop identifier ('All' without a Loop column) to the fit result
+    """
+    freq_col = find_frequency_column(df.columns.tolist())
+    mag_col = channel_column(channel, 'Resistivity (Ohm-m)')
+    phase_col = channel_column(channel, 'Phase_Shift[rad]')
+    if freq_col is None or mag_col not in df.columns or phase_col not in df.columns:
+        return {}
+    data = df
+    if f_min is not None:
+        data = data[data[freq_col] >= f_min]
+    if f_max is not None:
+        data = data[data[freq_col] <= f_max]
+    groups = data.groupby('Loop', sort=True) if 'Loop' in data.columns else [('All', data)]
+    results = {}
+    for loop, spectrum in groups:
+        try:
+            results[str(loop)] = debye_decomposition(
+                spectrum[freq_col], spectrum[mag_col], spectrum[phase_col],
+                lam=lam, tau_per_decade=tau_per_decade
+            )
+        except ValueError as e:
+            logger.warning(f"Debye decomposition skipped for loop {loop}: {e}")
+    return results
+
+
+def dd_results_table(results: Dict[Tuple[str, str], Dict[str, Dict]]) -> pd.DataFrame:
+    """Flatten {(file, channel): {loop: fit}} into one row of integral parameters per spectrum."""
+    rows = [
+        {'File': file_name, 'Channel': channel, 'Loop': loop, **fit['parameters']}
+        for (file_name, channel), loops in results.items()
+        for loop, fit in loops.items()
+    ]
+    return pd.DataFrame(rows)
+
+
+def create_dd_fit_figure(fit: Dict, title: str, dark: bool = False) -> go.Figure:
+    """Measured vs fitted phase and |ρ| (left) and the relaxation-time distribution m(τ) (right)."""
+    fig = make_subplots(
+        rows=2, cols=2, shared_xaxes=True, column_widths=[0.55, 0.45],
+        specs=[[{}, {"rowspan": 2}], [{}, None]],
+        vertical_spacing=0.1, horizontal_spacing=0.1,
+        subplot_titles=("Phase", "Relaxation-time distribution", "Resistivity magnitude")
+    )
+    freq = fit['freq']
+    dense_freq = np.logspace(np.log10(freq.min()), np.log10(freq.max()), 200)
+    model = dd_forward(dense_freq, fit['rho0'], fit['m'], fit['tau'])
+    measured = dict(mode='markers', marker=dict(size=7, color='#E6E8EB' if dark else '#000000'),
+                    legendgroup='measured')
+    fitted = dict(mode='lines', line=dict(width=2, color='#D55E00'), legendgroup='fitted')
+    fig.add_trace(go.Scatter(x=freq, y=-fit['phase_rad'] * 1000, name='Measured', **measured), row=1, col=1)
+    fig.add_trace(go.Scatter(x=dense_freq, y=-np.angle(model) * 1000, name='DD fit', **fitted), row=1, col=1)
+    fig.add_trace(go.Scatter(x=freq, y=fit['rho_magnitude'], name='Measured', showlegend=False, **measured),
+                  row=2, col=1)
+    fig.add_trace(go.Scatter(x=dense_freq, y=np.abs(model), name='DD fit', showlegend=False, **fitted),
+                  row=2, col=1)
+    fig.add_trace(go.Scatter(
+        x=fit['tau'], y=fit['m'], mode='lines+markers', name='m(τ)',
+        line=dict(color='#0072B2'), marker=dict(size=4)
+    ), row=1, col=2)
+    params = fit['parameters']
+    for key, label, dash, position in (('tau_50 (s)', 'τ<sub>50</sub>', 'dash', 'top left'),
+                                       ('tau_mean (s)', 'τ<sub>mean</sub>', 'dot', 'top right')):
+        if np.isfinite(params[key]):
+            fig.add_vline(x=params[key], line=dict(dash=dash, color='gray'), row=1, col=2,
+                          annotation_text=label, annotation_position=position)
+    fig.update_xaxes(type='log')
+    fig.update_xaxes(title_text='f (Hz)', row=2, col=1)
+    fig.update_xaxes(title_text='τ (s)', row=1, col=2)
+    fig.update_yaxes(title_text='−φ (mrad)', row=1, col=1)
+    fig.update_yaxes(title_text='|ρ| (Ω·m)', row=2, col=1)
+    fig.update_yaxes(title_text='m', row=1, col=2)
+    fig.update_layout(title=dict(text=title, x=0.5, xanchor='center'), height=650)
+    style = get_research_presets()[DARK_STYLE_PRESET if dark else DEFAULT_STYLE_PRESET]
+    legend = {'show': True, 'title': '', 'orientation': 'h', **LEGEND_POSITIONS['outside-bottom']}
+    fig = apply_style_to_figure(fig, style, None, None, legend)
+    # apply_style sets one line width / marker size for all traces; keep the measured points visible
+    fig.update_traces(marker=dict(size=7), selector=dict(mode='markers'))
+    fig.update_traces(marker=dict(size=4), selector=dict(mode='lines+markers'))
+    return fig
+
+
+def render_debye_decomposition_section(datasets: Dict[str, pd.DataFrame], key_prefix: str):
+    """Debye decomposition UI: settings, per-spectrum fit plot, parameter table and CSV export."""
+    st.caption(
+        "Fits ρ(ω) = ρ0·[1 − Σ m_k·(1 − 1/(1 + iωτ_k))] to each spectrum on a log-spaced τ grid "
+        "(measured range ± 1 decade) with a smoothness-regularised non-negative least-squares fit, "
+        "and reports the integral parameters of Weigand & Kemna (2016)."
+    )
+    datasets = {name: df for name, df in datasets.items() if get_phase_channels(df.columns.tolist())}
+    if not datasets:
+        st.info("Debye decomposition needs resistivity and phase data.")
+        return
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if len(datasets) > 1:
+            files = st.multiselect("Files", options=list(datasets), default=list(datasets),
+                                   key=f"{key_prefix}_dd_files",
+                                   help="Every loop of every selected file is fitted separately")
+        else:
+            files = list(datasets)
+        channels = sorted({ch for name in files for ch in get_phase_channels(datasets[name].columns.tolist())})
+        if not channels:
+            st.info("Select at least one file.")
+            return
+        channel = st.selectbox("Channel", options=channels, key=f"{key_prefix}_dd_channel",
+                               help="Measurement channel to decompose; uses its |ρ| and raw phase shift")
+    with col2:
+        all_freqs = sorted({
+            float(f) for name in files
+            for f in datasets[name][find_frequency_column(datasets[name].columns.tolist())].dropna()
+            if f > 0
+        })
+        if len(all_freqs) < 3:
+            st.info("At least 3 frequencies are needed.")
+            return
+        f_min, f_max = st.select_slider(
+            "Frequency range (Hz)", options=all_freqs, value=(all_freqs[0], all_freqs[-1]),
+            format_func=lambda f: f"{float(f):g}", key=f"{key_prefix}_dd_frange",
+            help="Exclude e.g. high frequencies affected by electromagnetic coupling"
+        )
+    with col3:
+        lam_mode = st.radio("Regularisation λ", ["Auto", "Manual"], horizontal=True,
+                            key=f"{key_prefix}_dd_lam_mode",
+                            help="Auto picks the smoothest m(τ) that still fits the data to "
+                                 "0.1 % in |ρ| and 0.1 mrad in phase")
+        lam = None
+        if lam_mode == "Manual":
+            lam = 10 ** st.slider("log10(λ)", -2.0, 10.0, 4.0, 0.5, key=f"{key_prefix}_dd_lam",
+                                  help="Larger λ gives a smoother m(τ) but a worse fit; smaller λ fits "
+                                       "noise with spiky distributions")
+        tau_per_decade = st.number_input("τ values per decade", min_value=5, max_value=40,
+                                         help="Density of the relaxation-time grid. 10 per decade "
+                                              "resolves the distribution; more only slows the fit.",
+                                         value=DD_TAU_PER_DECADE, key=f"{key_prefix}_dd_tpd")
+
+    if not st.checkbox(
+        "Run Debye decomposition", key=f"{key_prefix}_dd_run",
+        help="Describes each spectrum as a sum of Debye relaxations with chargeabilities m_k at "
+             "relaxation times τ_k. Integral parameters summarise m(τ): total polarization (m_tot, "
+             "m_tot_n) and characteristic time scales (τ_mean, τ_50), related to grain/pore size."
+    ):
+        return
+
+    results = {}
+    with st.spinner("Fitting Debye decomposition..."):
+        for name in files:
+            fits = fit_debye_decomposition(datasets[name], channel, f_min, f_max, lam, int(tau_per_decade))
+            if fits:
+                results[(name, channel)] = fits
+            else:
+                st.warning(f"No Debye decomposition for {name} ({channel}).")
+    if not results:
+        return
+
+    table = dd_results_table(results)
+    spectra = [(name, ch, loop) for (name, ch), fits in results.items() for loop in fits]
+    selected = st.selectbox(
+        "Show fit for", options=spectra, key=f"{key_prefix}_dd_show",
+        format_func=lambda s: f"{s[0]} · {s[1]} · Loop {s[2]}"
+    )
+    fit = results[(selected[0], selected[1])][selected[2]]
+    st.plotly_chart(
+        create_dd_fit_figure(fit, f"{selected[0]} · {selected[1]} · Loop {selected[2]}", page_is_dark()),
+        use_container_width=True, config=get_plot_config(), theme=None
+    )
+    params = fit['parameters']
+    metric_cols = st.columns(5)
+    metric_cols[0].metric("ρ0 (Ω·m)", f"{params['rho0 (Ohm-m)']:.4g}", help=DD_PARAMETER_HELP['rho0 (Ohm-m)'])
+    metric_cols[1].metric("m_tot", f"{params['m_tot']:.4g}", help=DD_PARAMETER_HELP['m_tot'])
+    metric_cols[2].metric("τ_50 (s)", f"{params['tau_50 (s)']:.3g}", help=DD_PARAMETER_HELP['tau_50 (s)'])
+    metric_cols[3].metric("RMS |ρ| misfit", f"{params['RMS |rho| misfit (%)']:.3f} %",
+                          help=DD_PARAMETER_HELP['RMS |rho| misfit (%)'])
+    metric_cols[4].metric("RMS phase misfit", f"{params['RMS phase misfit (mrad)']:.3f} mrad",
+                          help=DD_PARAMETER_HELP['RMS phase misfit (mrad)'])
+
+    st.markdown("**Integral parameters**")
+    st.dataframe(table, hide_index=True, use_container_width=True,
+                 column_config={
+                     **number_column_config(
+                         table.columns, exclude=['File', 'Channel', 'Loop', 'tau_peaks (s)', 'n_peaks', 'n_freqs']
+                     ),
+                     **{c: st.column_config.Column(help=h) for c, h in DD_PARAMETER_HELP.items()
+                        if c in ('tau_peaks (s)', 'n_peaks', 'n_freqs')},
+                 })
+    st.download_button(
+        label="Download DD parameters (CSV)",
+        data=table.to_csv(index=False).encode('utf-8'),
+        file_name="sip_debye_decomposition.csv",
+        mime="text/csv",
+        key=f"{key_prefix}_dd_download"
+    )
+
+
+# ============================================================================
+# PLOT STYLE, COLOURS AND EXPORT
+# ============================================================================
+PLOT_FONT_FAMILY = "Arial, Helvetica, sans-serif"
+DEFAULT_STYLE_PRESET = "Publication"
+DARK_STYLE_PRESET = "Publication (dark)"
+
+# Okabe & Ito (2008) colour-blind safe palette
+COLORBLIND_SAFE_PALETTE = [
+    '#0072B2', '#E69F00', '#009E73', '#CC79A7', '#D55E00', '#56B4E9', '#F0E442', '#000000'
+]
+PALETTES = ['Colour-blind safe', 'Plotly', 'Viridis (sequential)', 'Greyscale']
+
+DEFAULT_FONT_CONFIG = {'title_size': 16, 'axis_label_size': 14, 'tick_size': 12, 'legend_size': 12}
+LEGEND_POSITIONS = {
+    "top-left": {"x": 0.01, "y": 0.99, "xanchor": "left", "yanchor": "top"},
+    "top-right": {"x": 0.99, "y": 0.99, "xanchor": "right", "yanchor": "top"},
+    "bottom-left": {"x": 0.01, "y": 0.01, "xanchor": "left", "yanchor": "bottom"},
+    "bottom-right": {"x": 0.99, "y": 0.01, "xanchor": "right", "yanchor": "bottom"},
+    "outside-right": {"x": 1.02, "y": 1.0, "xanchor": "left", "yanchor": "top"},
+    "outside-bottom": {"x": 0.5, "y": -0.15, "xanchor": "center", "yanchor": "top"},
+}
+
+
+def get_plot_config():
+    """Plotly toolbar config: hi-res PNG download, drawing tools, no logo."""
+    return {
         'toImageButtonOptions': {
             'format': 'png',
             'filename': 'sip_plot',
@@ -628,301 +1449,109 @@ def get_plot_config():
         'modeBarButtonsToAdd': [
             'drawline', 'drawopenpath', 'drawclosedpath', 'drawcircle', 'drawrect', 'eraseshape'
         ],
-        'modeBarButtonsToRemove': []
     }
 
 
-def get_line_color_customization(traces, key_prefix=""):
-    """Create UI for individual line color customization.
-    
-    Args:
-        traces: List of trace names/identifiers
-        key_prefix: Prefix for widget keys
-        
-    Returns:
-        Dictionary mapping trace names to colors
+def page_is_dark() -> bool:
+    """True when the viewer has the dark app theme active (⋮ menu → Settings)."""
+    try:
+        return st.context.theme.type == 'dark'
+    except Exception:
+        return False
+
+
+def default_style_preset() -> str:
+    """Figure preset that matches the app theme."""
+    return DARK_STYLE_PRESET if page_is_dark() else DEFAULT_STYLE_PRESET
+
+
+def _to_hex(color: str) -> str:
+    """Convert a Plotly 'rgb(r, g, b)' colour to '#rrggbb' (hex colours pass through)."""
+    if color.startswith('#'):
+        return color
+    r, g, b = (int(round(float(v))) for v in color[color.index('(') + 1:color.index(')')].split(',')[:3])
+    return f'#{r:02x}{g:02x}{b:02x}'
+
+
+def palette_colors(palette: str, n: int, dark: bool = False) -> List[str]:
+    """n hex colours from a named palette; sequential palettes spread over their range.
+
+    With dark=True, black/dark entries are swapped for light ones so lines stay visible
+    on a dark background.
     """
-    st.markdown("**🎨 Individual Line Colors:**")
-    
-    # Default color palette
-    default_colors = [
-        '#636EFA', '#EF553B', '#00CC96', '#AB63FA', '#FFA15A',
-        '#19D3F3', '#FF6692', '#B6E880', '#FF97FF', '#FECB52'
-    ]
-    
-    color_map = {}
-    
-    # Create color pickers for each trace
-    for idx, trace_name in enumerate(traces):
-        default_color = default_colors[idx % len(default_colors)]
-        color = st.color_picker(
-            f"Line {idx + 1}: {trace_name[:30]}",
-            value=default_color,
-            key=f"{key_prefix}_line_{idx}"
-        )
-        color_map[trace_name] = color
-    
-    return color_map
+    if n <= 0:
+        return []
+    positions = [i / max(n - 1, 1) for i in range(n)]
+    if palette == 'Viridis (sequential)':
+        # Skip the end of viridis that vanishes on the background (yellow on white, purple on dark)
+        start, end = (0.25, 1.0) if dark else (0.0, 0.9)
+        return [_to_hex(c) for c in px.colors.sample_colorscale(
+            'Viridis', [start + (end - start) * p for p in positions])]
+    if palette == 'Greyscale':
+        ends = [[0, 'rgb(255,255,255)'], [1, 'rgb(110,110,110)']] if dark else \
+               [[0, 'rgb(0,0,0)'], [1, 'rgb(180,180,180)']]
+        return [_to_hex(c) for c in px.colors.sample_colorscale(ends, positions)]
+    colors = px.colors.qualitative.Plotly if palette == 'Plotly' else COLORBLIND_SAFE_PALETTE
+    if dark:
+        colors = ['#FFFFFF' if c == '#000000' else c for c in colors]
+    return [colors[i % len(colors)] for i in range(n)]
 
 
-def get_plot_style_customization(key_prefix=""):
-    """Create UI for plot style customization.
-    
-    Args:
-        key_prefix: Prefix for widget keys
-        
-    Returns:
-        Dictionary with style settings
-    """
-    st.markdown("**🎨 Plot Style:**")
-    
-    with st.expander("📊 Background Colors"):
-        col1, col2 = st.columns(2)
-        with col1:
-            plot_bg = st.color_picker(
-                "Plot Background",
-                value="#000000",
-                help="Background inside plot area",
-                key=f"{key_prefix}_plot_bg"
+def get_line_colors_ui(trace_names: List[str], palette: str, key_prefix: str = "",
+                       dark: bool = False) -> Dict[str, str]:
+    """Colours from the chosen palette, with optional per-line overrides."""
+    colors = dict(zip(trace_names, palette_colors(palette, len(trace_names), dark)))
+    if trace_names and st.checkbox("Set colours per line", key=f"{key_prefix}_custom_colors"):
+        for idx, name in enumerate(trace_names):
+            colors[name] = st.color_picker(
+                name[:40], value=colors[name], key=f"{key_prefix}_line_{idx}_{palette}_{dark}"
             )
-        with col2:
-            paper_bg = st.color_picker(
-                "Paper Background",
-                value="#000000",
-                help="Background outside plot area",
-                key=f"{key_prefix}_paper_bg"
-            )
-    
-    with st.expander("✏️ Text Colors"):
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            title_color = st.color_picker(
-                "Title",
-                value="#FFFFFF",
-                key=f"{key_prefix}_title_color"
-            )
-        with col2:
-            axis_color = st.color_picker(
-                "Axis Labels",
-                value="#FFFFFF",
-                key=f"{key_prefix}_axis_color"
-            )
-        with col3:
-            legend_color = st.color_picker(
-                "Legend",
-                value="#FFFFFF",
-                key=f"{key_prefix}_legend_color"
-            )
-    
-    with st.expander("📐 Grid & Lines"):
-        col1, col2 = st.columns(2)
-        with col1:
-            grid_color = st.color_picker(
-                "Grid Color",
-                value="#808080",
-                key=f"{key_prefix}_grid"
-            )
-            grid_opacity = st.slider(
-                "Grid Opacity",
-                0.0, 1.0, 0.3, 0.1,
-                key=f"{key_prefix}_grid_opacity"
-            )
-        with col2:
-            zeroline_color = st.color_picker(
-                "Zero Line",
-                value="#808080",
-                key=f"{key_prefix}_zeroline"
-            )
-            zeroline_opacity = st.slider(
-                "Zero Line Opacity",
-                0.0, 1.0, 0.5, 0.1,
-                key=f"{key_prefix}_zeroline_opacity"
-            )
-    
-    with st.expander("📦 Legend Style"):
-        col1, col2 = st.columns(2)
-        with col1:
-            legend_bg = st.color_picker(
-                "Background",
-                value="#000000",
-                key=f"{key_prefix}_legend_bg"
-            )
-            legend_bg_opacity = st.slider(
-                "BG Opacity",
-                0.0, 1.0, 0.8, 0.1,
-                key=f"{key_prefix}_legend_bg_opacity"
-            )
-        with col2:
-            legend_border = st.color_picker(
-                "Border",
-                value="#FFFFFF",
-                key=f"{key_prefix}_legend_border"
-            )
-            legend_border_width = st.slider(
-                "Border Width",
-                0, 5, 1,
-                key=f"{key_prefix}_legend_border_width"
-            )
-    
-    with st.expander("📏 Line Settings"):
-        col1, col2 = st.columns(2)
-        with col1:
-            line_width = st.slider(
-                "Line Width",
-                1, 8, 2,
-                key=f"{key_prefix}_line_width"
-            )
-        with col2:
-            marker_size = st.slider(
-                "Marker Size",
-                2, 16, 6,
-                key=f"{key_prefix}_marker_size"
-            )
-    
-    return {
-        'plot_bgcolor': plot_bg,
-        'paper_bgcolor': paper_bg,
-        'title_color': title_color,
-        'axis_color': axis_color,
-        'legend_text_color': legend_color,
-        'grid_color': grid_color,
-        'grid_opacity': grid_opacity,
-        'zeroline_color': zeroline_color,
-        'zeroline_opacity': zeroline_opacity,
-        'legend_bgcolor': legend_bg,
-        'legend_bg_opacity': legend_bg_opacity,
-        'legend_border_color': legend_border,
-        'legend_border_width': legend_border_width,
-        'line_width': line_width,
-        'marker_size': marker_size
-    }
+    return colors
 
 
-def apply_style_to_figure(fig, style_config, line_colors=None, font_config=None, legend_config=None):
-    """Apply style customizations to a Plotly figure.
-    
-    Args:
-        fig: Plotly figure object
-        style_config: Dictionary with style settings
-        line_colors: Optional dictionary mapping trace names to colors
-        font_config: Optional dictionary with font sizes
-        legend_config: Optional dictionary with legend settings
-    """
-    def hex_to_rgba(hex_color, opacity=1.0):
-        hex_color = hex_color.lstrip('#')
-        r, g, b = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
-        return f'rgba({r},{g},{b},{opacity})'
-    
-    grid_rgba = hex_to_rgba(style_config['grid_color'], style_config['grid_opacity'])
-    zeroline_rgba = hex_to_rgba(style_config['zeroline_color'], style_config['zeroline_opacity'])
-    legend_bg_rgba = hex_to_rgba(style_config['legend_bgcolor'], style_config['legend_bg_opacity'])
-    
-    # Default font sizes if not provided
-    if font_config is None:
-        font_config = {
-            'title_size': 16,
-            'axis_label_size': 12,
-            'tick_size': 10,
-            'legend_size': 10
-        }
-    
-    # Default legend config if not provided
-    if legend_config is None:
-        legend_config = {
-            'show': True,
-            'title': '',
-            'orientation': 'vertical',
-            'x': 0.01,
-            'y': 0.99,
-            'xanchor': 'left',
-            'yanchor': 'top'
-        }
-    
-    # Build legend dict
-    legend_dict = {
-        'bgcolor': legend_bg_rgba,
-        'bordercolor': style_config['legend_border_color'],
-        'borderwidth': style_config['legend_border_width'],
-        'font': dict(
-            color=style_config['legend_text_color'],
-            size=font_config['legend_size']
-        ),
-        'orientation': legend_config['orientation'],
-        'x': legend_config['x'],
-        'y': legend_config['y'],
-        'xanchor': legend_config['xanchor'],
-        'yanchor': legend_config['yanchor']
-    }
-    
-    if legend_config.get('title'):
-        legend_dict['title'] = dict(
-            text=legend_config['title'],
-            font=dict(size=font_config['legend_size'] + 2)
-        )
-    
-    fig.update_layout(
-        paper_bgcolor=style_config['paper_bgcolor'],
-        plot_bgcolor=style_config['plot_bgcolor'],
-        font=dict(
-            color=style_config['axis_color'],
-            size=font_config['tick_size']
-        ),
-        title=dict(
-            font=dict(
-                color=style_config['title_color'],
-                size=font_config['title_size']
-            )
-        ),
-        xaxis=dict(
-            gridcolor=grid_rgba,
-            zerolinecolor=zeroline_rgba,
-            color=style_config['axis_color'],
-            title=dict(font=dict(size=font_config['axis_label_size'])),
-            tickfont=dict(size=font_config['tick_size'])
-        ),
-        yaxis=dict(
-            gridcolor=grid_rgba,
-            zerolinecolor=zeroline_rgba,
-            color=style_config['axis_color'],
-            title=dict(font=dict(size=font_config['axis_label_size'])),
-            tickfont=dict(size=font_config['tick_size'])
-        ),
-        legend=legend_dict,
-        showlegend=legend_config['show']
-    )
-    
-    # Apply line colors and settings
-    if line_colors:
-        for trace in fig.data:
-            trace_name = trace.name
-            if trace_name in line_colors:
-                trace.update(
-                    line=dict(
-                        color=line_colors[trace_name],
-                        width=style_config['line_width']
-                    ),
-                    marker=dict(
-                        size=style_config['marker_size'],
-                        color=line_colors[trace_name]
-                    )
-                )
-    else:
-        # Apply default line settings
-        fig.update_traces(
-            line=dict(width=style_config['line_width']),
-            marker=dict(size=style_config['marker_size'])
-        )
-    
-    return fig
-
-#WIP - PRESETS
 def get_research_presets():
     """Return dictionary of research paper quality presets.
-    
+
     Returns:
         Dictionary with preset configurations
     """
     return {
+        "Publication": {
+            'plot_bgcolor': '#FFFFFF',
+            'paper_bgcolor': '#FFFFFF',
+            'title_color': '#000000',
+            'axis_color': '#000000',
+            'legend_text_color': '#000000',
+            'grid_color': '#D9D9D9',
+            'grid_opacity': 0.6,
+            'zeroline_color': '#9E9E9E',
+            'zeroline_opacity': 0.6,
+            'legend_bgcolor': '#FFFFFF',
+            'legend_bg_opacity': 0.8,
+            'legend_border_color': '#BFBFBF',
+            'legend_border_width': 1,
+            'line_width': 2,
+            'marker_size': 6,
+            'description': 'White background, boxed axes, light grid'
+        },
+        "Publication (dark)": {
+            'plot_bgcolor': '#0E1117',
+            'paper_bgcolor': '#0E1117',
+            'title_color': '#E6E8EB',
+            'axis_color': '#E6E8EB',
+            'legend_text_color': '#E6E8EB',
+            'grid_color': '#3A4150',
+            'grid_opacity': 0.8,
+            'zeroline_color': '#6B7380',
+            'zeroline_opacity': 0.8,
+            'legend_bgcolor': '#0E1117',
+            'legend_bg_opacity': 0.8,
+            'legend_border_color': '#6B7380',
+            'legend_border_width': 1,
+            'line_width': 2,
+            'marker_size': 6,
+            'description': 'Boxed axes on the dark app background, for screen work'
+        },
         "Nature/Science": {
             'plot_bgcolor': '#FFFFFF',
             'paper_bgcolor': '#FFFFFF',
@@ -995,6 +1624,24 @@ def get_research_presets():
             'marker_size': 5,
             'description': 'Standard publication style'
         },
+        "Grayscale Print": {
+            'plot_bgcolor': '#FFFFFF',
+            'paper_bgcolor': '#FFFFFF',
+            'title_color': '#000000',
+            'axis_color': '#000000',
+            'legend_text_color': '#000000',
+            'grid_color': '#CCCCCC',
+            'grid_opacity': 0.3,
+            'zeroline_color': '#000000',
+            'zeroline_opacity': 0.8,
+            'legend_bgcolor': '#F5F5F5',
+            'legend_bg_opacity': 1.0,
+            'legend_border_color': '#000000',
+            'legend_border_width': 1,
+            'line_width': 2,
+            'marker_size': 6,
+            'description': 'Optimized for B&W printing (use the Greyscale palette)'
+        },
         "Presentation": {
             'plot_bgcolor': '#000000',
             'paper_bgcolor': '#000000',
@@ -1013,557 +1660,276 @@ def get_research_presets():
             'marker_size': 8,
             'description': 'Dark theme, high visibility'
         },
-        "Grayscale Print": {
-            'plot_bgcolor': '#FFFFFF',
-            'paper_bgcolor': '#FFFFFF',
-            'title_color': '#000000',
-            'axis_color': '#000000',
-            'legend_text_color': '#000000',
-            'grid_color': '#CCCCCC',
-            'grid_opacity': 0.3,
-            'zeroline_color': '#000000',
-            'zeroline_opacity': 0.8,
-            'legend_bgcolor': '#F5F5F5',
-            'legend_bg_opacity': 1.0,
-            'legend_border_color': '#000000',
-            'legend_border_width': 1,
-            'line_width': 2,
-            'marker_size': 6,
-            'description': 'Optimized for B&W printing'
-        }
     }
 
 
-def get_colorblind_safe_palette():
-    """Return colorblind-safe color palette.
-    
-    Returns:
-        List of hex colors
-    """
-    return [
-        '#0173B2',  # Blue
-        '#DE8F05',  # Orange
-        '#029E73',  # Green
-        '#CC78BC',  # Purple
-        '#CA9161',  # Brown
-        '#949494',  # Gray
-        '#ECE133',  # Yellow
-        '#56B4E9'   # Sky Blue
-    ]
+def apply_style_to_figure(fig, style_config, line_colors=None, font_config=None, legend_config=None):
+    """Apply style customizations to a Plotly figure.
 
-
-def get_export_ui(fig, key_prefix=""):
-    """Create advanced export UI with dimension and format options.
-    
     Args:
-        fig: Plotly figure to export
-        key_prefix: Prefix for widget keys
-        
-    Returns:
-        None (handles export internally)
+        fig: Plotly figure object
+        style_config: Dictionary with style settings
+        line_colors: Optional dictionary mapping trace names to colors
+        font_config: Optional dictionary with font sizes
+        legend_config: Optional dictionary with legend settings
     """
-    st.markdown("---")
-    st.markdown("### 📥 Export Plot")
-    
-    with st.expander("Export Settings", expanded=True):
-        # Export format
-        export_format = st.selectbox(
-            "File Format",
-            options=['PNG', 'SVG', 'PDF', 'JPEG'],
-            help="PNG: Raster, best for most uses | SVG: Vector, scalable | PDF: Vector, publications | JPEG: Compressed",
-            key=f"{key_prefix}_export_format"
-        )
-        
-        # Preset dimensions
-        col1, col2 = st.columns(2)
-        with col1:
-            preset = st.selectbox(
-                "Dimension Preset",
-                options=[
-                    'Custom',
-                    'Publication Single Column (3.5" × 2.5")',
-                    'Publication Double Column (7" × 5")',
-                    'Publication Full Page (8.5" × 6.5")',
-                    'Presentation 16:9 (1920 × 1080)',
-                    'Presentation 4:3 (1600 × 1200)',
-                    'Poster (3600 × 2700)',
-                    'Screen HD (1280 × 720)',
-                    'Screen Full HD (1920 × 1440)',
-                    'Ultra HD (3840 × 2160)'
-                ],
-                key=f"{key_prefix}_preset"
-            )
-        
-        # Dimension mapping
-        preset_dims = {
-            'Custom': (1600, 1200),
-            'Publication Single Column (3.5" × 2.5")': (1050, 750),
-            'Publication Double Column (7" × 5")': (2100, 1500),
-            'Publication Full Page (8.5" × 6.5")': (2550, 1950),
-            'Presentation 16:9 (1920 × 1080)': (1920, 1080),
-            'Presentation 4:3 (1600 × 1200)': (1600, 1200),
-            'Poster (3600 × 2700)': (3600, 2700),
-            'Screen HD (1280 × 720)': (1280, 720),
-            'Screen Full HD (1920 × 1440)': (1920, 1440),
-            'Ultra HD (3840 × 2160)': (3840, 2160)
-        }
-        
-        default_width, default_height = preset_dims.get(preset, (1600, 1200))
-        
-        with col2:
-            dpi = st.selectbox(
-                "DPI / Quality",
-                options=[72, 150, 300, 600],
-                index=2,
-                help="72: Screen | 150: Draft print | 300: Publication | 600: High quality",
-                key=f"{key_prefix}_dpi"
-            )
-        
-        # Custom dimensions
-        if preset == 'Custom':
-            col1, col2 = st.columns(2)
-            with col1:
-                width = st.number_input(
-                    "Width (pixels)",
-                    min_value=400,
-                    max_value=10000,
-                    value=default_width,
-                    step=100,
-                    key=f"{key_prefix}_width"
-                )
-            with col2:
-                height = st.number_input(
-                    "Height (pixels)",
-                    min_value=300,
-                    max_value=10000,
-                    value=default_height,
-                    step=100,
-                    key=f"{key_prefix}_height"
-                )
-        else:
-            width = default_width
-            height = default_height
-            st.info(f"Dimensions: {width} × {height} pixels")
-        
-        # Scale factor
-        scale = st.slider(
-            "Scale Factor",
-            min_value=1,
-            max_value=4,
-            value=2,
-            help="Higher scale = better quality, larger file. 2× is standard.",
-            key=f"{key_prefix}_scale"
-        )
-        
-        # File name
-        filename = st.text_input(
-            "Filename",
-            value=f"sip_plot.{export_format.lower()}",
-            key=f"{key_prefix}_filename"
-        )
-        
-        # Calculate file info
-        estimated_size = (width * height * scale * scale * 3) / (1024 * 1024)  # Rough estimate
-        st.caption(f"Estimated size: ~{estimated_size:.1f} MB | Final: {width * scale} × {height * scale} pixels")
-        
-        # Export button
-        if st.button("📥 Export Plot", type="primary", key=f"{key_prefix}_export_btn"):
-            try:
-                # Update figure size
-                fig.update_layout(
-                    width=width,
-                    height=height
-                )
-                
-                # Export based on format
-                if export_format == 'PNG':
-                    img_bytes = fig.to_image(
-                        format='png',
-                        width=width,
-                        height=height,
-                        scale=scale
-                    )
-                    mime_type = 'image/png'
-                elif export_format == 'JPEG':
-                    img_bytes = fig.to_image(
-                        format='jpeg',
-                        width=width,
-                        height=height,
-                        scale=scale
-                    )
-                    mime_type = 'image/jpeg'
-                elif export_format == 'SVG':
-                    img_bytes = fig.to_image(
-                        format='svg',
-                        width=width,
-                        height=height
-                    )
-                    mime_type = 'image/svg+xml'
-                elif export_format == 'PDF':
-                    img_bytes = fig.to_image(
-                        format='pdf',
-                        width=width,
-                        height=height
-                    )
-                    mime_type = 'application/pdf'
-                
-                # Provide download button
-                st.download_button(
-                    label=f"⬇️ Download {export_format}",
-                    data=img_bytes,
-                    file_name=filename,
-                    mime=mime_type,
-                    key=f"{key_prefix}_download"
-                )
-                
-                st.success(f"✅ Plot exported successfully! Click 'Download {export_format}' above.")
-                
-            except Exception as e:
-                st.error(f"Export failed: {str(e)}")
-                st.info("💡 Tip: Try installing kaleido: `pip install kaleido`")
+    def hex_to_rgba(hex_color, opacity=1.0):
+        hex_color = hex_color.lstrip('#')
+        r, g, b = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+        return f'rgba({r},{g},{b},{opacity})'
 
+    grid_rgba = hex_to_rgba(style_config['grid_color'], style_config['grid_opacity'])
+    zeroline_rgba = hex_to_rgba(style_config['zeroline_color'], style_config['zeroline_opacity'])
+    legend_bg_rgba = hex_to_rgba(style_config['legend_bgcolor'], style_config['legend_bg_opacity'])
 
-def get_research_customization_ui(key_prefix=""):
-    """Create research-paper level customization UI with presets, fonts, and legend control.
-    
-    Args:
-        key_prefix: Prefix for widget keys
-        
-    Returns:
-        Tuple of (style_config, use_colorblind, font_config, legend_config)
-    """
-    st.markdown("---")
-    st.markdown("**🎓 Research Paper Customization:**")
-    
-    # Preset selection
-    presets = get_research_presets()
-    preset_names = list(presets.keys())
-    
-    selected_preset = st.selectbox(
-        "📋 Style Preset",
-        options=['Custom'] + preset_names,
-        help="Choose a journal-specific preset or custom",
-        key=f"{key_prefix}_preset_select"
+    if font_config is None:
+        font_config = DEFAULT_FONT_CONFIG
+
+    if legend_config is None:
+        legend_config = {'show': True, 'title': '', 'orientation': 'v', **LEGEND_POSITIONS['top-left']}
+
+    legend_dict = {
+        'bgcolor': legend_bg_rgba,
+        'bordercolor': style_config['legend_border_color'],
+        'borderwidth': style_config['legend_border_width'],
+        'font': dict(
+            color=style_config['legend_text_color'],
+            size=font_config['legend_size']
+        ),
+        'orientation': legend_config['orientation'],
+        'x': legend_config['x'],
+        'y': legend_config['y'],
+        'xanchor': legend_config['xanchor'],
+        'yanchor': legend_config['yanchor']
+    }
+
+    if legend_config.get('title'):
+        legend_dict['title'] = dict(
+            text=legend_config['title'],
+            font=dict(size=font_config['legend_size'] + 2)
+        )
+
+    fig.update_layout(
+        paper_bgcolor=style_config['paper_bgcolor'],
+        plot_bgcolor=style_config['plot_bgcolor'],
+        font=dict(
+            family=PLOT_FONT_FAMILY,
+            color=style_config['axis_color'],
+            size=font_config['tick_size']
+        ),
+        title=dict(
+            font=dict(
+                color=style_config['title_color'],
+                size=font_config['title_size']
+            )
+        ),
+        legend=legend_dict,
+        showlegend=legend_config['show']
     )
-    
-    # Initialize style_config
-    if selected_preset != 'Custom':
-        st.caption(f"ℹ️ {presets[selected_preset]['description']}")
-        
-        # Load preset values
-        preset_config = presets[selected_preset].copy()
-        preset_config.pop('description', None)
-        
-        # Show preset values but allow override
-        override = st.checkbox("Override preset values", value=False, key=f"{key_prefix}_override")
-        
-        if override:
-            # Get custom values but initialize with preset defaults
-            style_config = get_plot_style_customization_with_defaults(key_prefix, preset_config)
-        else:
-            style_config = preset_config
+
+    # Style every x/y axis so multi-panel figures (subplots) are styled consistently:
+    # boxed axes with outside ticks, as in printed figures
+    axis_style = dict(
+        gridcolor=grid_rgba,
+        zerolinecolor=zeroline_rgba,
+        color=style_config['axis_color'],
+        showline=True,
+        linecolor=style_config['axis_color'],
+        linewidth=1,
+        mirror=True,
+        ticks='outside',
+        title_font=dict(size=font_config['axis_label_size']),
+        tickfont=dict(size=font_config['tick_size'])
+    )
+    fig.update_xaxes(**axis_style)
+    fig.update_yaxes(**axis_style)
+    # Log axes: labelled decades as powers of ten, unlabelled minor ticks in between
+    log_axis_style = dict(dtick=1, exponentformat='power', minor=dict(ticks='outside', showgrid=False))
+    fig.for_each_xaxis(lambda axis: axis.update(**log_axis_style) if axis.type == 'log' else None)
+    fig.for_each_yaxis(lambda axis: axis.update(**log_axis_style) if axis.type == 'log' else None)
+    # Subplot titles are annotations; keep them in the title colour
+    fig.update_annotations(font=dict(color=style_config['title_color']))
+
+    # Apply line colors and settings
+    if line_colors:
+        for trace in fig.data:
+            trace_name = trace.name
+            if trace_name in line_colors:
+                trace.update(
+                    line=dict(
+                        color=line_colors[trace_name],
+                        width=style_config['line_width']
+                    ),
+                    marker=dict(
+                        size=style_config['marker_size'],
+                        color=line_colors[trace_name]
+                    )
+                )
     else:
-        # Full custom mode
-        default_config = {
-            'plot_bgcolor': '#000000',
-            'paper_bgcolor': '#000000',
-            'title_color': '#FFFFFF',
-            'axis_color': '#FFFFFF',
-            'legend_text_color': '#FFFFFF',
-            'grid_color': '#808080',
-            'grid_opacity': 0.3,
-            'zeroline_color': '#808080',
-            'zeroline_opacity': 0.5,
-            'legend_bgcolor': '#000000',
-            'legend_bg_opacity': 0.8,
-            'legend_border_color': '#FFFFFF',
-            'legend_border_width': 1,
-            'line_width': 2,
-            'marker_size': 6
-        }
-        style_config = get_plot_style_customization_with_defaults(key_prefix, default_config)
-    
-    # Font customization
-    st.markdown("---")
-    with st.expander("🔤 Font Sizes", expanded=False):
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            title_size = st.slider(
-                "Title",
-                min_value=10,
-                max_value=32,
-                value=16,
-                key=f"{key_prefix}_title_size"
-            )
-        with col2:
-            axis_label_size = st.slider(
-                "Axis Labels",
-                min_value=8,
-                max_value=24,
-                value=12,
-                key=f"{key_prefix}_axis_label_size"
-            )
-        with col3:
-            tick_size = st.slider(
-                "Tick Labels",
-                min_value=6,
-                max_value=20,
-                value=10,
-                key=f"{key_prefix}_tick_size"
-            )
-        
-        legend_size = st.slider(
-            "Legend Text",
-            min_value=6,
-            max_value=20,
-            value=10,
-            key=f"{key_prefix}_legend_size"
+        # Apply default line settings
+        fig.update_traces(
+            line=dict(width=style_config['line_width']),
+            marker=dict(size=style_config['marker_size'])
         )
-    
+
+    return fig
+
+
+def get_style_overrides_ui(key_prefix: str, defaults: Dict, preset_name: str) -> Dict:
+    """Colour and line overrides, initialised from the selected preset."""
+    key = f"{key_prefix}_{preset_name}"
+    col1, col2 = st.columns(2)
+    with col1:
+        plot_bg = st.color_picker("Plot background", value=defaults['plot_bgcolor'], key=f"{key}_plot_bg")
+        text_color = st.color_picker("Text and axes", value=defaults['axis_color'], key=f"{key}_text")
+        grid_color = st.color_picker("Grid", value=defaults['grid_color'], key=f"{key}_grid")
+        legend_bg = st.color_picker("Legend background", value=defaults['legend_bgcolor'], key=f"{key}_legend_bg")
+    with col2:
+        paper_bg = st.color_picker("Paper background", value=defaults['paper_bgcolor'], key=f"{key}_paper_bg")
+        zeroline_color = st.color_picker("Zero line", value=defaults['zeroline_color'], key=f"{key}_zeroline")
+        legend_border = st.color_picker("Legend border", value=defaults['legend_border_color'],
+                                        key=f"{key}_legend_border")
+    grid_opacity = st.slider("Grid opacity", 0.0, 1.0, float(defaults['grid_opacity']), 0.1, key=f"{key}_grid_opacity")
+    line_width = st.slider("Line width", 1, 8, int(defaults['line_width']), key=f"{key}_line_width")
+    marker_size = st.slider("Marker size", 2, 16, int(defaults['marker_size']), key=f"{key}_marker_size")
+    return {
+        **defaults,
+        'plot_bgcolor': plot_bg,
+        'paper_bgcolor': paper_bg,
+        'title_color': text_color,
+        'axis_color': text_color,
+        'legend_text_color': text_color,
+        'grid_color': grid_color,
+        'grid_opacity': grid_opacity,
+        'zeroline_color': zeroline_color,
+        'legend_bgcolor': legend_bg,
+        'legend_border_color': legend_border,
+        'line_width': line_width,
+        'marker_size': marker_size,
+    }
+
+
+def get_style_ui(key_prefix: str = "") -> Tuple[Dict, str, Dict, Dict]:
+    """Figure style controls: preset, palette, font sizes and legend.
+
+    Returns:
+        Tuple of (style_config, palette name, font_config, legend_config)
+    """
+    presets = get_research_presets()
+    default_preset = default_style_preset()
+    preset_name = st.selectbox(
+        "Style preset", options=list(presets), index=list(presets).index(default_preset),
+        # The key includes the default so the preset follows a light/dark theme switch
+        key=f"{key_prefix}_preset_select_{default_preset}",
+        help="Publication: white figure with boxed axes for print. Publication (dark): the same on "
+             "the dark app background. The journal presets follow typical author guidelines. "
+             "Exported files use exactly the style shown."
+    )
+    style_config = presets[preset_name].copy()
+    st.caption(style_config.pop('description'))
+    palette = st.selectbox("Line palette", options=PALETTES, key=f"{key_prefix}_palette",
+                           help="Colour-blind safe: Okabe & Ito (2008), readable with all common colour "
+                                "vision deficiencies. Viridis: perceptually uniform sequence, suited to "
+                                "ordered loops (e.g. a time series). Greyscale: for black-and-white print.")
+    if st.checkbox("Adjust colours and lines", key=f"{key_prefix}_override"):
+        style_config = get_style_overrides_ui(key_prefix, style_config, preset_name)
+
+    st.markdown("**Font sizes**")
+    col1, col2 = st.columns(2)
+    with col1:
+        title_size = st.number_input("Title", 8, 36, DEFAULT_FONT_CONFIG['title_size'], key=f"{key_prefix}_title_size")
+        tick_size = st.number_input("Tick labels", 6, 30, DEFAULT_FONT_CONFIG['tick_size'], key=f"{key_prefix}_tick_size")
+    with col2:
+        axis_label_size = st.number_input("Axis labels", 6, 30, DEFAULT_FONT_CONFIG['axis_label_size'],
+                                          key=f"{key_prefix}_axis_label_size")
+        legend_size = st.number_input("Legend", 6, 30, DEFAULT_FONT_CONFIG['legend_size'],
+                                      key=f"{key_prefix}_legend_size")
     font_config = {
         'title_size': title_size,
         'axis_label_size': axis_label_size,
         'tick_size': tick_size,
         'legend_size': legend_size
     }
-    
-    # Legend editor
-    st.markdown("---")
-    with st.expander("📦 Legend Editor", expanded=False):
-        col1, col2 = st.columns(2)
-        with col1:
-            legend_position = st.selectbox(
-                "Position",
-                options=[
-                    "top-left", "top-center", "top-right",
-                    "middle-left", "middle-right",
-                    "bottom-left", "bottom-center", "bottom-right",
-                    "outside-right"
-                ],
-                index=0,
-                key=f"{key_prefix}_legend_pos"
-            )
-        with col2:
-            legend_orientation = st.selectbox(
-                "Orientation",
-                options=["Vertical", "Horizontal"],
-                index=0,
-                key=f"{key_prefix}_legend_orient"
-            )
-        
-        # Map to Plotly's expected values
-        orientation_map = {
-            "Vertical": "v",
-            "Horizontal": "h"
-        }
-        plotly_orientation = orientation_map[legend_orientation]
-        
-        show_legend = st.checkbox(
-            "Show Legend",
-            value=True,
-            key=f"{key_prefix}_show_legend"
-        )
-        
-        if show_legend:
-            legend_title = st.text_input(
-                "Legend Title (optional)",
-                value="",
-                key=f"{key_prefix}_legend_title"
-            )
-        else:
-            legend_title = ""
-    
-    # Map legend position to coordinates
-    legend_pos_map = {
-        "top-left": {"x": 0.01, "y": 0.99, "xanchor": "left", "yanchor": "top"},
-        "top-center": {"x": 0.5, "y": 0.99, "xanchor": "center", "yanchor": "top"},
-        "top-right": {"x": 0.99, "y": 0.99, "xanchor": "right", "yanchor": "top"},
-        "middle-left": {"x": 0.01, "y": 0.5, "xanchor": "left", "yanchor": "middle"},
-        "middle-right": {"x": 0.99, "y": 0.5, "xanchor": "right", "yanchor": "middle"},
-        "bottom-left": {"x": 0.01, "y": 0.01, "xanchor": "left", "yanchor": "bottom"},
-        "bottom-center": {"x": 0.5, "y": 0.01, "xanchor": "center", "yanchor": "bottom"},
-        "bottom-right": {"x": 0.99, "y": 0.01, "xanchor": "right", "yanchor": "bottom"},
-        "outside-right": {"x": 1.02, "y": 0.5, "xanchor": "left", "yanchor": "middle"}
-    }
-    
+
+    st.markdown("**Legend**")
+    show_legend = st.checkbox("Show legend", value=True, key=f"{key_prefix}_show_legend")
+    col1, col2 = st.columns(2)
+    with col1:
+        legend_position = st.selectbox("Position", options=list(LEGEND_POSITIONS),
+                                       key=f"{key_prefix}_legend_pos")
+    with col2:
+        legend_orientation = st.selectbox("Orientation", options=["Vertical", "Horizontal"],
+                                          key=f"{key_prefix}_legend_orient")
+    legend_title = st.text_input("Legend title", value="", key=f"{key_prefix}_legend_title")
     legend_config = {
         'show': show_legend,
         'title': legend_title,
-        'orientation': plotly_orientation,
-        **legend_pos_map[legend_position]
+        'orientation': 'v' if legend_orientation == "Vertical" else 'h',
+        **LEGEND_POSITIONS[legend_position]
     }
-    
-    # Colorblind-safe palette option
-    st.markdown("---")
-    use_colorblind = st.checkbox(
-        "🌈 Use Colorblind-Safe Palette",
-        help="Apply scientifically-validated colorblind-safe colors",
-        key=f"{key_prefix}_colorblind"
-    )
-    
-    return style_config, use_colorblind, font_config, legend_config
+    return style_config, palette, font_config, legend_config
 
 
-def get_plot_style_customization_with_defaults(key_prefix="", defaults=None):
-    """Create UI for plot style customization with default values.
-    
+def get_export_ui(fig, key_prefix=""):
+    """Figure export controls (format, size, resolution) with a download button.
+
     Args:
+        fig: Plotly figure to export
         key_prefix: Prefix for widget keys
-        defaults: Dictionary with default values
-        
-    Returns:
-        Dictionary with style settings
     """
-    if defaults is None:
-        defaults = {
-            'plot_bgcolor': '#000000',
-            'paper_bgcolor': '#000000',
-            'title_color': '#FFFFFF',
-            'axis_color': '#FFFFFF',
-            'legend_text_color': '#FFFFFF',
-            'grid_color': '#808080',
-            'grid_opacity': 0.3,
-            'zeroline_color': '#808080',
-            'zeroline_opacity': 0.5,
-            'legend_bgcolor': '#000000',
-            'legend_bg_opacity': 0.8,
-            'legend_border_color': '#FFFFFF',
-            'legend_border_width': 1,
-            'line_width': 2,
-            'marker_size': 6
-        }
-    
-    st.markdown("**🎨 Plot Style:**")
-    
-    with st.expander("📊 Background Colors"):
-        col1, col2 = st.columns(2)
-        with col1:
-            plot_bg = st.color_picker(
-                "Plot Background",
-                value=defaults.get('plot_bgcolor', '#000000'),
-                help="Background inside plot area",
-                key=f"{key_prefix}_plot_bg"
-            )
-        with col2:
-            paper_bg = st.color_picker(
-                "Paper Background",
-                value=defaults.get('paper_bgcolor', '#000000'),
-                help="Background outside plot area",
-                key=f"{key_prefix}_paper_bg"
-            )
-    
-    with st.expander("✏️ Text Colors"):
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            title_color = st.color_picker(
-                "Title",
-                value=defaults.get('title_color', '#FFFFFF'),
-                key=f"{key_prefix}_title_color"
-            )
-        with col2:
-            axis_color = st.color_picker(
-                "Axis Labels",
-                value=defaults.get('axis_color', '#FFFFFF'),
-                key=f"{key_prefix}_axis_color"
-            )
-        with col3:
-            legend_color = st.color_picker(
-                "Legend",
-                value=defaults.get('legend_text_color', '#FFFFFF'),
-                key=f"{key_prefix}_legend_color"
-            )
-    
-    with st.expander("📐 Grid & Lines"):
-        col1, col2 = st.columns(2)
-        with col1:
-            grid_color = st.color_picker(
-                "Grid Color",
-                value=defaults.get('grid_color', '#808080'),
-                key=f"{key_prefix}_grid"
-            )
-            grid_opacity = st.slider(
-                "Grid Opacity",
-                0.0, 1.0, 
-                defaults.get('grid_opacity', 0.3), 
-                0.1,
-                key=f"{key_prefix}_grid_opacity"
-            )
-        with col2:
-            zeroline_color = st.color_picker(
-                "Zero Line",
-                value=defaults.get('zeroline_color', '#808080'),
-                key=f"{key_prefix}_zeroline"
-            )
-            zeroline_opacity = st.slider(
-                "Zero Line Opacity",
-                0.0, 1.0, 
-                defaults.get('zeroline_opacity', 0.5), 
-                0.1,
-                key=f"{key_prefix}_zeroline_opacity"
-            )
-    
-    with st.expander("📦 Legend Style"):
-        col1, col2 = st.columns(2)
-        with col1:
-            legend_bg = st.color_picker(
-                "Background",
-                value=defaults.get('legend_bgcolor', '#000000'),
-                key=f"{key_prefix}_legend_bg"
-            )
-            legend_bg_opacity = st.slider(
-                "BG Opacity",
-                0.0, 1.0, 
-                defaults.get('legend_bg_opacity', 0.8), 
-                0.1,
-                key=f"{key_prefix}_legend_bg_opacity"
-            )
-        with col2:
-            legend_border = st.color_picker(
-                "Border",
-                value=defaults.get('legend_border_color', '#FFFFFF'),
-                key=f"{key_prefix}_legend_border"
-            )
-            legend_border_width = st.slider(
-                "Border Width",
-                0, 5, 
-                defaults.get('legend_border_width', 1),
-                key=f"{key_prefix}_legend_border_width"
-            )
-    
-    with st.expander("📏 Line Settings"):
-        col1, col2 = st.columns(2)
-        with col1:
-            line_width = st.slider(
-                "Line Width",
-                1, 8, 
-                defaults.get('line_width', 2),
-                key=f"{key_prefix}_line_width"
-            )
-        with col2:
-            marker_size = st.slider(
-                "Marker Size",
-                2, 16, 
-                defaults.get('marker_size', 6),
-                key=f"{key_prefix}_marker_size"
-            )
-    
-    return {
-        'plot_bgcolor': plot_bg,
-        'paper_bgcolor': paper_bg,
-        'title_color': title_color,
-        'axis_color': axis_color,
-        'legend_text_color': legend_color,
-        'grid_color': grid_color,
-        'grid_opacity': grid_opacity,
-        'zeroline_color': zeroline_color,
-        'zeroline_opacity': zeroline_opacity,
-        'legend_bgcolor': legend_bg,
-        'legend_bg_opacity': legend_bg_opacity,
-        'legend_border_color': legend_border,
-        'legend_border_width': legend_border_width,
-        'line_width': line_width,
-        'marker_size': marker_size
+    export_format = st.selectbox(
+        "File format",
+        options=['PNG', 'SVG', 'PDF', 'JPEG'],
+        help="PNG: raster | SVG / PDF: vector, for publications | JPEG: compressed",
+        key=f"{key_prefix}_export_format"
+    )
+    preset_dims = {
+        'Single column (3.5" × 2.5" @ 300 dpi)': (1050, 750),
+        'Double column (7" × 5" @ 300 dpi)': (2100, 1500),
+        'Full page (8.5" × 6.5" @ 300 dpi)': (2550, 1950),
+        'Presentation 16:9 (1920 × 1080)': (1920, 1080),
+        'Presentation 4:3 (1600 × 1200)': (1600, 1200),
+        'Poster (3600 × 2700)': (3600, 2700),
+        'Custom': (1600, 1200),
     }
+    preset = st.selectbox("Size", options=list(preset_dims), key=f"{key_prefix}_preset")
+    width, height = preset_dims[preset]
+    if preset == 'Custom':
+        col1, col2 = st.columns(2)
+        with col1:
+            width = st.number_input("Width (px)", min_value=400, max_value=10000, value=width,
+                                    step=100, key=f"{key_prefix}_width")
+        with col2:
+            height = st.number_input("Height (px)", min_value=300, max_value=10000, value=height,
+                                     step=100, key=f"{key_prefix}_height")
+    scale = st.slider("Scale factor", min_value=1, max_value=4, value=2,
+                      help="Raster formats only: multiplies the pixel size", key=f"{key_prefix}_scale")
+    filename = st.text_input("Filename", value=f"sip_plot.{export_format.lower()}", key=f"{key_prefix}_filename")
+    st.caption(f"{width} × {height} px" + (f", rendered at {width * scale} × {height * scale} px"
+                                            if export_format in ('PNG', 'JPEG') else ""))
+
+    if st.button("Prepare file", type="primary", key=f"{key_prefix}_export_btn"):
+        try:
+            export_fig = go.Figure(fig)
+            export_fig.update_layout(width=width, height=height)
+            fmt = export_format.lower()
+            kwargs = dict(format=fmt, width=width, height=height)
+            if fmt in ('png', 'jpeg'):
+                kwargs['scale'] = scale
+            img_bytes = export_fig.to_image(**kwargs)
+            mime_type = {'png': 'image/png', 'jpeg': 'image/jpeg',
+                         'svg': 'image/svg+xml', 'pdf': 'application/pdf'}[fmt]
+            st.download_button(
+                label=f"Download {export_format}",
+                data=img_bytes,
+                file_name=filename,
+                mime=mime_type,
+                key=f"{key_prefix}_download"
+            )
+        except Exception as e:
+            st.error(f"Export failed: {str(e)}")
+            st.info("Figure export needs the kaleido package (and Chrome/Chromium).")
+
 
 # ============================================================================
 # STATISTICAL ANALYSIS FUNCTIONS
@@ -1614,327 +1980,340 @@ def descriptive_stats(self, columns: List[str]) -> pd.DataFrame:
         return pd.DataFrame(stats_dict).T
     
 
+def get_loop_selection_ui(datasets: Dict[str, pd.DataFrame], key_prefix: str) -> Optional[Dict[str, List[str]]]:
+    """Loop filter per file. Returns {file: selected loops}, or None when no file has loops."""
+    with_loops = {name: df for name, df in datasets.items() if 'Loop' in df.columns}
+    if not with_loops:
+        return None
+    selected_loops = {}
+    for name, df in with_loops.items():
+        loops = sorted(df['Loop'].unique())
+        label = "Loops" if len(datasets) == 1 else f"Loops · {name}"
+        selected_loops[name] = st.multiselect(
+            label, options=loops, default=loops, key=f"{key_prefix}_loops_{name}",
+            help="Repeated frequency sweeps within one file. Loops that overlap indicate a stable, "
+                 "reproducible measurement."
+        )
+    return selected_loops
+
+
+def render_spectra_tab(datasets: Dict[str, pd.DataFrame], key_prefix: str):
+    """Plot controls (left) and figure (right) for one or more processed files."""
+    col_ctrl, col_plot = st.columns([1, 3], gap="large")
+    with col_ctrl:
+        if len(datasets) > 1:
+            names = st.multiselect("Files", options=list(datasets), default=list(datasets),
+                                   key=f"{key_prefix}_files", help="Files shown in the figure")
+            datasets = {name: datasets[name] for name in names}
+        if not datasets:
+            st.warning("Select at least one file.")
+            return
+        first = next(iter(datasets.values()))
+        common_cols = [c for c in first.columns if all(c in df.columns for df in datasets.values())]
+
+        plot_mode = st.radio(
+            "Plot", ["SIP two-panel", "Custom X / Y"], horizontal=True, key=f"{key_prefix}_plot_mode",
+            help="SIP two-panel: the standard SIP figure, phase −φ above a magnitude or conductivity "
+                 "quantity on a shared log-frequency axis. Custom X / Y: any two quantities."
+        )
+        two_panel = get_two_panel_settings_ui(common_cols, key_prefix) if plot_mode == "SIP two-panel" else None
+        plot_type = 'overlay'
+        if two_panel is None:
+            numeric_cols = [c for c in common_cols if pd.api.types.is_numeric_dtype(first[c])]
+            if not numeric_cols:
+                st.error("No common numeric columns to plot.")
+                return
+            freq_col = find_frequency_column(numeric_cols)
+            default_y = next((c for c in numeric_cols if c.endswith(PHASE_QUANTITY)), numeric_cols[-1])
+            quantity_help = ("Quantities are shown with symbol and unit; exported CSV files keep "
+                             "the original column names. −φ is the phase in mrad, positive for a "
+                             "capacitive (polarizing) response.")
+            x_axis = st.selectbox("X axis", options=numeric_cols, format_func=display_name,
+                                  index=numeric_cols.index(freq_col) if freq_col else 0,
+                                  key=f"{key_prefix}_x", help=quantity_help)
+            y_axis = st.selectbox("Y axis", options=numeric_cols, format_func=display_name,
+                                  index=numeric_cols.index(default_y), key=f"{key_prefix}_y",
+                                  help=quantity_help)
+            if len(datasets) > 1:
+                plot_type = st.radio("Layout", ["overlay", "subplots"], horizontal=True,
+                                     format_func=lambda x: "Overlay" if x == "overlay" else "One panel per file",
+                                     key=f"{key_prefix}_plot_type",
+                                     help="Overlay: all files in one panel. One panel per file: "
+                                          "stacked panels with the same quantities.")
+        log_cols = st.columns(2)
+        log_x = log_cols[0].checkbox("Log x", value=True, key=f"{key_prefix}_log_x",
+                                     help="Logarithmic frequency axis, standard for spectra that span "
+                                          "several decades")
+        log_y = log_cols[1].checkbox("Log lower y" if two_panel else "Log y", value=False,
+                                     key=f"{key_prefix}_log_y",
+                                     help="Logarithmic y axis for quantities spanning orders of magnitude "
+                                          "(|ρ|, σ). Not suited to phase, which can be zero or negative.")
+        selected_loops = get_loop_selection_ui(datasets, key_prefix)
+
+        with st.expander("Labels"):
+            if two_panel:
+                channel = two_panel['channel']
+                labels = get_labels_ui({
+                    'Title': f"{channel} SIP spectrum",
+                    'X axis': axis_label(two_panel['freq_col']),
+                    'Upper y axis': axis_label(channel_column(channel, PHASE_QUANTITY)),
+                    'Lower y axis': axis_label(channel_column(channel, two_panel['bottom_quantity'])),
+                }, key_prefix)
+            else:
+                labels = get_labels_ui({
+                    'Title': display_name(y_axis),
+                    'X axis': axis_label(x_axis),
+                    'Y axis': axis_label(y_axis),
+                }, key_prefix)
+        with st.expander("Style"):
+            style_config, palette, font_config, legend_config = get_style_ui(key_prefix)
+            dark_figure = style_config['plot_bgcolor'].upper() in ('#000000', '#0E1117')
+
+        # Fluid calibration check applies when phase is plotted against frequency
+        if two_panel:
+            phase_channel, freq_col = two_panel['channel'], two_panel['freq_col']
+        elif y_axis.endswith(PHASE_QUANTITY) and x_axis == find_frequency_column(common_cols):
+            phase_channel, freq_col = split_channel(y_axis)[0], x_axis
+        else:
+            phase_channel, freq_col = None, find_frequency_column(common_cols)
+        first_name = next(iter(datasets))
+        with st.expander("Fluid calibration check"):
+            fluid = get_fluid_calibration_ui(
+                phase_channel,
+                measured_low_frequency_conductivity(datasets[first_name], phase_channel, freq_col)
+                if phase_channel else np.nan,
+                f"{key_prefix}_{first_name}_{phase_channel}"
+            )
+
+    if two_panel:
+        fig = create_sip_two_panel_plot(
+            datasets, two_panel['channel'], two_panel['bottom_quantity'], two_panel['freq_col'],
+            log_x=log_x, log_y_bottom=log_y, selected_loops=selected_loops,
+            title=labels['Title'], x_label=labels['X axis'],
+            top_label=labels['Upper y axis'], bottom_label=labels['Lower y axis']
+        )
+    else:
+        fig = create_comparison_plot(
+            datasets, x_axis, y_axis, log_x=log_x, log_y=log_y, plot_type=plot_type,
+            selected_loops=selected_loops, custom_title=labels['Title'],
+            custom_x_label=labels['X axis'], custom_y_label=labels['Y axis']
+        )
+    if not fig.data:
+        col_plot.warning("No data selected.")
+        return
+
+    # Two-panel traces share names, so colour each name once
+    trace_names = list(dict.fromkeys(trace.name for trace in fig.data))
+    with col_ctrl:
+        with st.expander("Line colours"):
+            line_colors = get_line_colors_ui(trace_names, palette, key_prefix, dark_figure)
+
+    fig = apply_style_to_figure(fig, style_config, line_colors, font_config, legend_config)
+    if fluid:
+        all_freqs = pd.concat([df[freq_col] for df in datasets.values()])
+        if two_panel:
+            fluid_rows = [1]
+        elif plot_type == 'subplots':
+            fluid_rows = list(range(1, len(datasets) + 1))
+        else:
+            fluid_rows = None
+        add_fluid_phase_overlay(fig, all_freqs.min(), all_freqs.max(),
+                                fluid['sigma'], fluid['eps_r'], fluid['tolerance'], rows=fluid_rows)
+
+    with col_plot:
+        st.plotly_chart(fig, use_container_width=True, config=get_plot_config(), theme=None)
+        if fluid:
+            show_fluid_deviation_table(datasets, freq_col, fluid, selected_loops)
+    with col_ctrl:
+        with st.expander("Export figure"):
+            get_export_ui(fig, key_prefix)
+
+
+def render_about():
+    """Landing text shown before any file is uploaded."""
+    st.info("Upload one or more SIP files in the sidebar to begin.")
+    st.markdown("""
+**Input formats**
+- O&E PSIP files (multi-channel, multiple loops; magnitude as ratio or dB, auto-detected)
+- Simple tables with frequency, magnitude and phase columns
+
+**Processing**
+- Resistance, resistivity |ρ|, conductivity σ, σ′ and σ″, and phase −φ (mrad) per channel
+- Sample geometry from length and area or diameter, set per file when comparing samples
+
+**Analysis**
+- SIP two-panel spectra (phase over magnitude/conductivity) or any X/Y combination
+- Fluid calibration check against the theoretical phase of water
+- Debye decomposition with integral parameters (Weigand & Kemna, 2016)
+
+**Output**
+- Processed data and Debye parameters as CSV; figures as PNG, SVG or PDF with journal style presets
+""")
+
+
 # ============================================================================
 # MAIN APPLICATION
 # ============================================================================
 
 def main():
-    st.title("SIP Data Analysis Tool")
- 
-    if 'datasets' not in st.session_state:
-        st.session_state.datasets = {}
- 
+    st.title("SDAT · SIP Data Analysis Tool")
+    st.caption("Spectral induced polarization data from O&E PSIP instruments")
+
     with st.sidebar:
-        st.header("1. Upload Data Files")
-        mode = st.radio("Analysis Mode", ["Single File", "Compare Multiple Files"])
+        st.header("Data")
+        mode = st.radio("Analysis mode", ["Single file", "Compare files"], horizontal=True,
+                        help="Single file: analyse one measurement. Compare files: plot several "
+                             "measurements together, each with its own sample geometry.")
         uploaded_files = st.file_uploader(
-            "Upload SIP files", type=["csv", "txt"], accept_multiple_files=True
+            "SIP files", type=["csv", "txt"], accept_multiple_files=True
         )
-        st.header("2. Sample Properties")
-        sample_length = st.number_input("Sample Length (m)", value=DEFAULT_SAMPLE_LENGTH, format="%.4f")
-        sample_area = st.number_input("Sample Area (m²)", value=DEFAULT_SAMPLE_AREA, format="%.4f")
-        manual_ref = st.number_input("Reference Resistor (Ohms)", value=0.0)
- 
+        active_file = None
+        if mode == "Single file" and uploaded_files and len(uploaded_files) > 1:
+            active_file = st.selectbox("Active file", options=[f.name for f in uploaded_files],
+                                       help="File analysed in single-file mode")
+
+        st.header("Sample & instrument")
+        sample_length = st.number_input(
+            "Sample length L (m)", value=DEFAULT_SAMPLE_LENGTH, format="%.4f",
+            help="Distance between the potential electrodes. Resistivity ρ = R·A/L."
+        )
+        size_input = st.radio("Cross-section", ["Area", "Diameter"], horizontal=True,
+                              help="Enter the cross-section as an area, or as the inner diameter of "
+                                   "a cylindrical holder (A = π(d/2)²)")
+        if size_input == "Diameter":
+            sample_diameter = st.number_input(
+                "Diameter d (m)", value=DEFAULT_SAMPLE_DIAMETER, format="%.4f", min_value=0.0,
+                help="Inner diameter of the cylindrical sample holder"
+            )
+            sample_area = area_from_diameter(sample_diameter)
+            st.caption(f"A = π(d/2)² = {sample_area:.6f} m²")
+        else:
+            sample_diameter = None
+            sample_area = st.number_input("Area A (m²)", value=DEFAULT_SAMPLE_AREA, format="%.6f",
+                                          help="Cross-sectional area of the sample, perpendicular "
+                                               "to the current flow")
+        global_geometry = {'length': sample_length, 'area': sample_area, 'diameter': sample_diameter}
+        manual_ref = st.number_input("Reference resistor R_ref (Ω)", value=0.0,
+                                     help="Resistor in series with the sample; the instrument measures "
+                                          "|Z|/R_ref, so R = ratio × R_ref. 0 uses the value in each "
+                                          "file header (Current Resistor[Ohms]).")
+        magnitude_unit_choice = st.selectbox(
+            "Magnitude unit",
+            options=["Auto-detect", "ratio", "dB"],
+            help="Auto-detect reads the column unit (Magnitude[ratio] / Magnitude[dB]) "
+                 "or the 'Writer_Version,2' header, which stores magnitude in dB "
+                 "(ratio = 10^(dB/20))."
+        )
+
+        st.header("Appearance")
+        st.caption("Switch between light and dark in the ⋮ menu (top right) → Settings → "
+                   "Choose app theme. Figures follow the theme; any figure style can be picked "
+                   "under Spectra → Style.")
+
     if not uploaded_files:
-        st.info("Please upload SIP file(s) to begin")
-        with st.expander("About this app"):
-            st.markdown("""
-            **Features:**
-            ### Intelligent Format Detection
-            - **O&E PSIP Format**: Full instrument output with metadata, multi-channel support
-            - **Simple Table Format**: Basic frequency/magnitude/phase data files
-            - Automatic detection - no manual format selection needed
-            
-            ### Interactive Visualization
-            - Multi-channel plotting with customizable axes
-            - Loop filtering and comparison
-            - Dual Y-axis support for comparing different parameters
-            - Logarithmic scaling options
-            - Hover tooltips for precise value inspection
-            
-            ### Robust Data Handling
-            - Handles files with multiple header sections
-            - European decimal format support (comma to dot conversion)
-            - Flexible separator detection (tabs, spaces)
-            - Empty column handling
-            - Automatic data type conversion
-            """)
+        render_about()
         return
- 
-    # ── Process each uploaded file ──
-    processed_datasets = {}
-    for uploaded_file in uploaded_files:
-        file_key = uploaded_file.name
-        sip_data, file_ref_resistor, format_name = parse_sip_file(uploaded_file)
-        if sip_data is None:
-            st.error(f"Failed to parse {file_key}")
-            continue
-        st.success(f"Loaded: **{file_key}** ({format_name})")
-        reference_resistor = manual_ref if manual_ref > 0 else file_ref_resistor
-        with st.spinner(f"Calculating properties for {file_key}..."):
+
+    tab_data, tab_spectra, tab_dd = st.tabs(["Data", "Spectra", "Debye decomposition"])
+
+    with tab_data:
+        summary_box = st.container()
+        # ── Per-file sample geometry (comparison mode) ──
+        file_geometry = {}
+        if mode == "Compare files":
+            with st.expander("Per-file sample geometry"):
+                st.caption("Set length and cross-section per file (e.g. files measured in different holders). "
+                           "Rows start from the sample properties in the sidebar.")
+                file_geometry = get_per_file_geometry_ui(
+                    [f.name for f in uploaded_files], sample_length, sample_area, sample_diameter
+                )
+
+        # ── Process each uploaded file ──
+        processed_datasets = {}
+        dataset_geometry = {}
+        summary_rows = []
+        for uploaded_file in uploaded_files:
+            file_key = uploaded_file.name
+            sip_data, file_ref_resistor, format_name, detected_unit = parse_sip_file(uploaded_file)
+            if sip_data is None:
+                st.error(f"Failed to parse {file_key}")
+                continue
+            if magnitude_unit_choice == "Auto-detect":
+                magnitude_unit, unit_note = detected_unit, f"{detected_unit} (detected)"
+            else:
+                magnitude_unit, unit_note = magnitude_unit_choice, f"{magnitude_unit_choice} (manual)"
+            reference_resistor = manual_ref if manual_ref > 0 else file_ref_resistor
+            geometry = file_geometry.get(file_key, global_geometry)
             sip_data = calculate_physics_properties(
-                sip_data, reference_resistor, sample_length, sample_area
+                sip_data, reference_resistor, geometry['length'], geometry['area'], magnitude_unit
             )
-        if 'Loop' in sip_data.columns:
-            sip_data['Loop'] = sip_data['Loop'].astype(str)
-        sip_data['Source_File'] = file_key
-        processed_datasets[file_key] = sip_data
- 
-    if not processed_datasets:
-        st.error("No files were successfully processed")
-        return
- 
-    st.divider()
- 
-    if mode == "Single File":
-        file_key = list(processed_datasets.keys())[0]
-        sip_data = processed_datasets[file_key]
- 
-        col_info1, col_info2, col_info3 = st.columns(3)
-        with col_info1:
-            st.metric("Total Measurements", len(sip_data))
-        with col_info2:
             if 'Loop' in sip_data.columns:
-                st.metric("Measurement Loops", len(sip_data['Loop'].unique()))
-            else:
-                st.metric("Measurement Loops", "N/A")
-        with col_info3:
-            channels = [col.split()[0] for col in sip_data.columns if 'Magnitude' in col]
-            st.metric("Channels", len(channels) if channels else 1)
- 
-        col1, col2 = st.columns([1, 3])
-        with col1:
-            st.subheader("Plot Settings")
-            all_cols = sip_data.columns.tolist()
-            default_x = next((i for i, col in enumerate(all_cols) if 'frequency' in col.lower()), 0)
-            default_y = max(0, len(all_cols) - 1)
-            x_axis = st.selectbox("X-Axis", options=all_cols, index=default_x)
-            y_axis = st.selectbox("Y-Axis", options=all_cols, index=default_y)
-            st.markdown("---")
-            st.markdown("**Customize Labels:**")
-            default_title = f"{y_axis} vs {x_axis}"
-            custom_title = st.text_input("Plot Title", value=default_title)
-            custom_x_label = st.text_input("X-Axis Label", value=x_axis)
-            custom_y_label = st.text_input("Y-Axis Label", value=y_axis)
-            st.markdown("---")
-            if 'Loop' in sip_data.columns:
-                all_loops = sip_data['Loop'].unique()
-                # Filter out "Loop" string and empty values to show only loop identifiers
-                valid_loops = [
-                    loop for loop in all_loops 
-                    if str(loop).strip() and str(loop).strip().lower() != 'loop'
-                ]
-                
-                if valid_loops:
-                    selected_loops = st.multiselect(
-                        "Select Loops", 
-                        valid_loops, 
-                        default=valid_loops,
-                        help="Choose which measurement loops to display"
-                    )
-                    plot_data = sip_data[sip_data['Loop'].isin(selected_loops)] if selected_loops else sip_data
-                else:
-                    # No valid loop identifiers found, use all data
-                    plot_data = sip_data
-                    st.info("No loop identifiers found. Displaying all measurement data.")
-            else:
-                plot_data = sip_data
-            log_x = st.checkbox("Log Scale X-Axis", value=True)
-            log_y = st.checkbox("Log Scale Y-Axis", value=False)
-            
-            # Get research-level plot customization
-            style_config, use_colorblind, font_config, legend_config = get_research_customization_ui("single_file")
- 
-        with col2:
-            if plot_data.empty:
-                st.warning("No data selected.")
-                return
-            
-            # Create initial figure
-            fig = px.line(
-                plot_data, x=x_axis, y=y_axis,
-                color='Loop' if 'Loop' in plot_data.columns else None,
-                markers=True, title=custom_title, log_x=log_x, log_y=log_y
-            )
-            
-            # Get trace names for line color customization
-            trace_names = [trace.name for trace in fig.data]
-            
-            # Show line color pickers in sidebar (inside col1)
-            with col1:
-                st.markdown("---")
-                if use_colorblind:
-                    colorblind_palette = get_colorblind_safe_palette()
-                    line_colors = {}
-                    for idx, trace_name in enumerate(trace_names):
-                        line_colors[trace_name] = colorblind_palette[idx % len(colorblind_palette)]
-                    st.success(f"✅ Applied colorblind-safe palette to {len(trace_names)} traces")
-                else:
-                    line_colors = get_line_color_customization(trace_names, "single_file")
-            
-            # Apply customizations
-            fig.update_layout(
-                height=600, hovermode='closest',
-                title=dict(x=0.5, xanchor='center', font=dict(size=16)),
-                xaxis_title=custom_x_label,
-                yaxis_title=custom_y_label
-            )
-            
-            # Apply style customizations with fonts and legend
-            fig = apply_style_to_figure(fig, style_config, line_colors, font_config, legend_config)
-            
-            st.plotly_chart(fig, use_container_width=True, config=get_plot_config(), theme=None)
-            
-            # Add export UI in sidebar
-            with col1:
-                get_export_ui(fig, "single_file")
- 
-        with st.expander("View Processed Data Table"):
-            st.dataframe(sip_data, use_container_width=True)
-        st.download_button(
-            label="Download CSV",
-            data=sip_data.to_csv(index=False).encode('utf-8'),
-            file_name=f"sip_processed_{file_key}",
+                sip_data['Loop'] = sip_data['Loop'].astype(str)
+            sip_data['Source_File'] = file_key
+            processed_datasets[file_key] = sip_data
+            dataset_geometry[file_key] = geometry
+            summary_rows.append({
+                "File": file_key,
+                "Format": format_name,
+                "Magnitude": unit_note,
+                "R_ref (Ω)": reference_resistor,
+                "Rows": len(sip_data),
+                "Loops": sip_data['Loop'].nunique() if 'Loop' in sip_data.columns else 1,
+                "Channels": len(get_phase_channels(sip_data.columns.tolist())) or 1,
+                "L (m)": geometry['length'],
+                "A (m²)": geometry['area'],
+            })
+
+        if not processed_datasets:
+            st.error("No files were successfully processed")
+            return
+
+        with summary_box:
+            st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True,
+                         column_config={
+                             **number_column_config(["R_ref (Ω)", "L (m)", "A (m²)"]),
+                             "Magnitude": st.column_config.Column(
+                                 help="Unit of the stored magnitude: ratio |Z|/R_ref, or dB = 20·log10(ratio)"),
+                             "Loops": st.column_config.Column(help="Repeated frequency sweeps in the file"),
+                             "Channels": st.column_config.Column(help="Channels with magnitude and phase data"),
+                         })
+
+        if mode == "Single file":
+            analysed = active_file if active_file in processed_datasets else next(iter(processed_datasets))
+            analysis_datasets = {analysed: processed_datasets[analysed]}
+        else:
+            analysis_datasets = processed_datasets
+
+        st.subheader("Processed data")
+        preview = st.selectbox("File", options=list(analysis_datasets)) if len(analysis_datasets) > 1 \
+            else next(iter(analysis_datasets))
+        st.dataframe(analysis_datasets[preview], use_container_width=True, height=320)
+        download_cols = st.columns(2)
+        download_cols[0].download_button(
+            label=f"Download {preview} (CSV)",
+            data=with_geometry_columns(processed_datasets[preview], dataset_geometry[preview])
+                .to_csv(index=False).encode('utf-8'),
+            file_name=f"sip_processed_{preview}",
             mime="text/csv"
         )
-    else:
-        # ── Multi-file comparison mode ──
-        st.subheader(f"Comparing {len(processed_datasets)} files")
-        summary_data = []
-        for name, df in processed_datasets.items():
-            channels = [col.split()[0] for col in df.columns if 'Magnitude' in col]
-            summary_data.append({
-                "File": name, "Rows": len(df),
-                "Channels": len(channels) if channels else 1,
-                "Loops": len(df['Loop'].unique()) if 'Loop' in df.columns else 1
-            })
-        st.dataframe(pd.DataFrame(summary_data), use_container_width=True)
-        st.divider()
- 
-        col1, col2 = st.columns([1, 3])
-        with col1:
-            st.subheader("Comparison Settings")
-            common_cols = set(processed_datasets[list(processed_datasets.keys())[0]].columns)
-            for df in processed_datasets.values():
-                common_cols = common_cols.intersection(set(df.columns))
-            common_cols = sorted(list(common_cols))
-            if not common_cols:
-                st.error("No common columns found across all files")
-                return
-            default_x = next((i for i, col in enumerate(common_cols) if 'frequency' in col.lower()), 0)
-            x_axis = st.selectbox("X-Axis", options=common_cols, index=default_x)
-            numeric_common_cols = [
-                col for col in common_cols
-                if pd.api.types.is_numeric_dtype(
-                    processed_datasets[list(processed_datasets.keys())[0]].get(col, pd.Series(dtype=float))
-                )
-            ]
-            if not numeric_common_cols:
-                st.error("No common numeric columns for Y-axis")
-                return
-            y_axis = st.selectbox("Y-Axis", options=numeric_common_cols)
-            st.markdown("---")
-            st.markdown("**Customize Labels:**")
-            custom_title = st.text_input("Plot Title", value=f"{y_axis} vs {x_axis} - Comparison")
-            custom_x_label = st.text_input("X-Axis Label", value=x_axis)
-            custom_y_label = st.text_input("Y-Axis Label", value=y_axis)
-            st.markdown("---")
-            plot_type = st.radio(
-                "Plot Type", ["overlay", "subplots"],
-                format_func=lambda x: "Overlay (Single Plot)" if x == "overlay" else "Subplots (Separate Plots)"
+        if len(analysis_datasets) > 1:
+            combined_df = pd.concat(
+                [with_geometry_columns(df, dataset_geometry[name]) for name, df in analysis_datasets.items()],
+                ignore_index=True
             )
-            log_x = st.checkbox("Log Scale X-Axis", value=True)
-            log_y = st.checkbox("Log Scale Y-Axis", value=False)
-            st.markdown("---")
-            st.markdown("**Files to Compare:**")
-            selected_files = {
-                name: processed_datasets[name]
-                for name in processed_datasets
-                if st.checkbox(name, value=True, key=f"select_{name}")
-            }
-            st.markdown("---")
-            st.markdown("**Loop Filtering:**")
-            has_loops = any('Loop' in df.columns for df in selected_files.values())
-            if has_loops:
-                selected_loops = {}
-                for name, df in selected_files.items():
-                    if 'Loop' in df.columns:
-                        loops = sorted(df['Loop'].unique())
-                        with st.expander(f"Loops for {name}"):
-                            col_a, col_b = st.columns(2)
-                            with col_a:
-                                if st.button("Select All", key=f"all_{name}"):
-                                    st.session_state[f"loops_{name}"] = loops
-                            with col_b:
-                                if st.button("Select None", key=f"none_{name}"):
-                                    st.session_state[f"loops_{name}"] = []
-                            if f"loops_{name}" not in st.session_state:
-                                st.session_state[f"loops_{name}"] = loops
-                            selected_loops[name] = st.multiselect(
-                                "Select loops", options=loops,
-                                default=st.session_state[f"loops_{name}"],
-                                key=f"loop_select_{name}"
-                            )
-                    else:
-                        selected_loops[name] = None
-            else:
-                selected_loops = None
-                st.info("No loop data available in selected files")
-            
-            # Get research-level plot customization
-            st.markdown("---")
-            style_config, use_colorblind, font_config, legend_config = get_research_customization_ui("comparison")
- 
-        with col2:
-            if not selected_files:
-                st.warning("Please select at least one file to plot")
-                return
-            
-            # Create initial figure
-            fig = create_comparison_plot(
-                selected_files, x_axis, y_axis,
-                log_x=log_x, log_y=log_y, plot_type=plot_type,
-                selected_loops=selected_loops,
-                custom_title=custom_title,
-                custom_x_label=custom_x_label,
-                custom_y_label=custom_y_label
-            )
-            
-            # Get trace names for line color customization
-            trace_names = [trace.name for trace in fig.data]
-            
-            # Show line color pickers in sidebar (inside col1)
-            with col1:
-                st.markdown("---")
-                if use_colorblind:
-                    colorblind_palette = get_colorblind_safe_palette()
-                    line_colors = {}
-                    for idx, trace_name in enumerate(trace_names):
-                        line_colors[trace_name] = colorblind_palette[idx % len(colorblind_palette)]
-                    st.success(f"✅ Applied colorblind-safe palette to {len(trace_names)} traces")
-                else:
-                    line_colors = get_line_color_customization(trace_names, "comparison")
-            
-            # Apply style customizations with fonts and legend
-            fig = apply_style_to_figure(fig, style_config, line_colors, font_config, legend_config)
-            
-            st.plotly_chart(fig, use_container_width=True, config=get_plot_config())
-            
-            # Add export UI in sidebar
-            with col1:
-                get_export_ui(fig, "comparison")
- 
-        st.divider()
-        st.subheader("Export Comparison Data")
-        if st.button("Combine All Data into Single CSV"):
-            combined_df = pd.concat(processed_datasets.values(), ignore_index=True)
-            st.download_button(
-                label="Download Combined CSV",
+            download_cols[1].download_button(
+                label=f"Download all {len(analysis_datasets)} files combined (CSV)",
                 data=combined_df.to_csv(index=False).encode('utf-8'),
                 file_name="sip_comparison_combined.csv",
                 mime="text/csv"
             )
-            st.success(f"Combined {len(processed_datasets)} files into one CSV with {len(combined_df)} total rows")
+
+    with tab_spectra:
+        render_spectra_tab(analysis_datasets, "single_file" if mode == "Single file" else "comparison")
+
+    with tab_dd:
+        render_debye_decomposition_section(analysis_datasets, "single_file" if mode == "Single file" else "comparison")
+
 
 if __name__ == "__main__":
     main()

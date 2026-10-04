@@ -1,0 +1,16 @@
+# Light and dark themes; viewers switch in the app menu (⋮ → Settings → Choose app theme).
+# Without a fixed base theme the app starts in the viewer's system preference.
+[theme]
+font = "sans serif"
+
+[theme.light]
+primaryColor = "#1F4E79"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F2F4F7"
+textColor = "#1B1F24"
+
+[theme.dark]
+primaryColor = "#6FA8DC"
+backgroundColor = "#0E1117"
+secondaryBackgroundColor = "#1A1F2B"
+textColor = "#E6E8EB"
