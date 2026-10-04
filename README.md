@@ -24,7 +24,8 @@ SIP Data Analyzer transforms tedious manual Excel workflows into a seamless, aut
 ### Interface
 - Sidebar for data and sample/instrument settings; results in Data, Spectra and Debye decomposition tabs
 - Quantities shown with their symbols and units (|ρ| (Ω·m), −φ (mrad), σ′/σ″) while CSV columns keep their names
-- Light theme (`.streamlit/config.toml`) and white publication-style figures by default: boxed axes, decade ticks as powers of ten, colour-blind safe palette (Okabe & Ito)
+- Light and dark themes (`.streamlit/config.toml`), switched in the app menu (⋮ → Settings → Choose app theme); figures follow the theme with publication-style presets: boxed axes, decade ticks as powers of ten, colour-blind safe palette (Okabe & Ito)
+- Every scientific setting and result column has a ? tooltip explaining it
 
 ### Interactive Visualization
 - Multi-channel plotting with customizable axes

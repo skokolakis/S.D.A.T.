@@ -580,10 +580,13 @@ def get_per_file_geometry_ui(file_names: List[str], default_length: float,
         use_container_width=True,
         key=f"geometry_editor_{size_col}",
         column_config={
-            "Length (m)": st.column_config.NumberColumn(min_value=0.0, format="%.4f", step=0.0001),
+            "Length (m)": st.column_config.NumberColumn(
+                min_value=0.0, format="%.4f", step=0.0001,
+                help="Distance between the potential electrodes for this file"),
             size_col: st.column_config.NumberColumn(
                 min_value=0.0, format="%.4f" if use_diameter else "%.6f",
-                step=0.0001 if use_diameter else 0.000001
+                step=0.0001 if use_diameter else 0.000001,
+                help="Holder inner diameter (A = π(d/2)²)" if use_diameter else "Sample cross-sectional area"
             ),
         }
     )
@@ -834,12 +837,15 @@ def get_two_panel_settings_ui(columns: List[str], key_prefix: str = "") -> Optio
     if not channels:
         st.warning("No phase data available for a two-panel SIP plot.")
         return None
-    channel = st.selectbox("Channel", options=channels, key=f"{key_prefix}_tp_channel")
+    channel = st.selectbox("Channel", options=channels, key=f"{key_prefix}_tp_channel",
+                           help="Measurement channel (potential electrode pair) of the PSIP instrument")
     quantities = [q for q in SIP_BOTTOM_QUANTITIES if channel_column(channel, q) in columns]
     bottom_quantity = st.selectbox(
         "Lower panel", options=quantities, key=f"{key_prefix}_tp_bottom",
         format_func=display_name,
-        help="Magnitude or conductivity quantity plotted below the phase"
+        help="Quantity plotted below the phase. |ρ|: resistivity magnitude = |R|·A/L. "
+             "σ: conductivity 1/|ρ|. σ′ = cos φ/|ρ|: conduction (in-phase). "
+             "σ″ = −sin φ/|ρ|: polarization (quadrature). |R|: measured resistance."
     )
     return {
         'channel': channel,
@@ -942,7 +948,12 @@ def get_fluid_calibration_ui(phase_channel: Optional[str], default_sigma_uscm: f
                              key_suffix: str) -> Optional[Dict[str, float]]:
     """Controls for the fluid calibration check. Returns settings when enabled."""
     st.caption("For calibration/QC measurements on water: φ(ω) = arctan(ε_r·ε0·ω/σ)")
-    enabled = st.checkbox("Overlay theoretical fluid phase", key="fluid_check_enabled")
+    enabled = st.checkbox(
+        "Overlay theoretical fluid phase", key="fluid_check_enabled",
+        help="A water sample does not polarize: its phase comes only from the dielectric "
+             "displacement current, φ = arctan(ε_r·ε0·ω/σ), which grows with frequency. Measured "
+             "phases outside the band point to instrument, electrode or cable errors."
+    )
     if not enabled:
         return None
     if phase_channel is None:
@@ -957,16 +968,20 @@ def get_fluid_calibration_ui(phase_channel: Optional[str], default_sigma_uscm: f
         help="Defaults to the measured low-frequency conductivity of the plotted channel"
     )
     eps_r = st.number_input("Relative permittivity ε_r", min_value=1.0,
-                            value=WATER_RELATIVE_PERMITTIVITY, key="fluid_eps_r")
+                            value=WATER_RELATIVE_PERMITTIVITY, key="fluid_eps_r",
+                            help="Relative dielectric permittivity of the fluid; water ≈ 80 at room temperature")
     tolerance = st.number_input("Tolerance band (± mrad)", min_value=0.0,
                                 value=DEFAULT_FLUID_TOLERANCE_MRAD, step=0.01,
-                                format="%.3f", key="fluid_tolerance")
+                                format="%.3f", key="fluid_tolerance",
+                                help="Accepted deviation of the measured phase from theory, shown as the "
+                                     "grey band and used for the 'within tolerance' percentage")
     return {'sigma': sigma, 'eps_r': eps_r, 'tolerance': tolerance, 'channel': phase_channel}
 
 
 def number_column_config(columns, exclude=(), fmt: str = "%.4g") -> Dict:
-    """st.dataframe column_config showing numbers to 4 significant figures."""
-    return {c: st.column_config.NumberColumn(format=fmt) for c in columns if c not in exclude}
+    """st.dataframe column_config showing numbers to 4 significant figures (with header help)."""
+    return {c: st.column_config.NumberColumn(format=fmt, help=COLUMN_HELP.get(c))
+            for c in columns if c not in exclude}
 
 
 def show_fluid_deviation_table(datasets: Dict[str, pd.DataFrame], freq_col: str,
@@ -985,6 +1000,39 @@ def show_fluid_deviation_table(datasets: Dict[str, pd.DataFrame], freq_col: str,
                     f"σ = {fluid['sigma']:g} µS/cm, ε_r = {fluid['eps_r']:g}")
         st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True,
                      column_config=number_column_config(rows[0], exclude=['Spectrum']))
+
+
+# Explanations shown as "?" tooltips on table headers and metrics
+DD_PARAMETER_HELP = {
+    'rho0 (Ohm-m)': "ρ0: DC resistivity, the model value for ω → 0",
+    'm_tot': "Total chargeability Σ m_k: strength of the polarization relative to ρ0",
+    'm_tot_n (S/m)': "Normalized chargeability m_tot/ρ0: polarization independent of the bulk "
+                     "resistivity, linked to the specific surface area",
+    'tau_mean (s)': "Mean relaxation time, the chargeability-weighted mean of log τ",
+    'tau_10 (s)': "τ at which the cumulative chargeability reaches 10 %",
+    'tau_50 (s)': "Median relaxation time: half of m_tot lies below this τ. Larger τ points to "
+                  "larger grains or pores",
+    'tau_60 (s)': "τ at which the cumulative chargeability reaches 60 %",
+    'U_tau': "Uniformity τ60/τ10: width of the relaxation-time distribution (1 = single time)",
+    'tau_peak1 (s)': "Relaxation time of the largest-τ (lowest-frequency) peak of m(τ)",
+    'tau_peaks (s)': "Relaxation times of all peaks of m(τ), largest τ first",
+    'n_peaks': "Number of peaks in m(τ)",
+    'RMS |rho| misfit (%)': "Root-mean-square relative misfit of the fitted |ρ|",
+    'RMS phase misfit (mrad)': "Root-mean-square misfit of the fitted phase",
+    'lambda': "Regularization strength used for this spectrum",
+    'f_min (Hz)': "Lowest frequency used in the fit",
+    'f_max (Hz)': "Highest frequency used in the fit",
+    'n_freqs': "Number of frequencies used in the fit",
+}
+COLUMN_HELP = {
+    **DD_PARAMETER_HELP,
+    'R_ref (Ω)': "Reference resistor used to convert the magnitude ratio |Z|/R_ref to resistance",
+    'L (m)': "Sample length used for this file",
+    'A (m²)': "Sample cross-sectional area used for this file",
+    'RMS deviation (mrad)': "Root-mean-square difference between measured and theoretical phase",
+    'Max |deviation| (mrad)': "Largest absolute difference between measured and theoretical phase",
+    'Within tolerance (%)': "Share of frequencies whose phase lies inside the tolerance band",
+}
 
 
 # ============================================================================
@@ -1204,7 +1252,7 @@ def dd_results_table(results: Dict[Tuple[str, str], Dict[str, Dict]]) -> pd.Data
     return pd.DataFrame(rows)
 
 
-def create_dd_fit_figure(fit: Dict, title: str) -> go.Figure:
+def create_dd_fit_figure(fit: Dict, title: str, dark: bool = False) -> go.Figure:
     """Measured vs fitted phase and |ρ| (left) and the relaxation-time distribution m(τ) (right)."""
     fig = make_subplots(
         rows=2, cols=2, shared_xaxes=True, column_widths=[0.55, 0.45],
@@ -1215,7 +1263,8 @@ def create_dd_fit_figure(fit: Dict, title: str) -> go.Figure:
     freq = fit['freq']
     dense_freq = np.logspace(np.log10(freq.min()), np.log10(freq.max()), 200)
     model = dd_forward(dense_freq, fit['rho0'], fit['m'], fit['tau'])
-    measured = dict(mode='markers', marker=dict(size=7, color='#000000'), legendgroup='measured')
+    measured = dict(mode='markers', marker=dict(size=7, color='#E6E8EB' if dark else '#000000'),
+                    legendgroup='measured')
     fitted = dict(mode='lines', line=dict(width=2, color='#D55E00'), legendgroup='fitted')
     fig.add_trace(go.Scatter(x=freq, y=-fit['phase_rad'] * 1000, name='Measured', **measured), row=1, col=1)
     fig.add_trace(go.Scatter(x=dense_freq, y=-np.angle(model) * 1000, name='DD fit', **fitted), row=1, col=1)
@@ -1240,7 +1289,7 @@ def create_dd_fit_figure(fit: Dict, title: str) -> go.Figure:
     fig.update_yaxes(title_text='|ρ| (Ω·m)', row=2, col=1)
     fig.update_yaxes(title_text='m', row=1, col=2)
     fig.update_layout(title=dict(text=title, x=0.5, xanchor='center'), height=650)
-    style = get_research_presets()[DEFAULT_STYLE_PRESET]
+    style = get_research_presets()[DARK_STYLE_PRESET if dark else DEFAULT_STYLE_PRESET]
     legend = {'show': True, 'title': '', 'orientation': 'h', **LEGEND_POSITIONS['outside-bottom']}
     fig = apply_style_to_figure(fig, style, None, None, legend)
     # apply_style sets one line width / marker size for all traces; keep the measured points visible
@@ -1265,14 +1314,16 @@ def render_debye_decomposition_section(datasets: Dict[str, pd.DataFrame], key_pr
     with col1:
         if len(datasets) > 1:
             files = st.multiselect("Files", options=list(datasets), default=list(datasets),
-                                   key=f"{key_prefix}_dd_files")
+                                   key=f"{key_prefix}_dd_files",
+                                   help="Every loop of every selected file is fitted separately")
         else:
             files = list(datasets)
         channels = sorted({ch for name in files for ch in get_phase_channels(datasets[name].columns.tolist())})
         if not channels:
             st.info("Select at least one file.")
             return
-        channel = st.selectbox("Channel", options=channels, key=f"{key_prefix}_dd_channel")
+        channel = st.selectbox("Channel", options=channels, key=f"{key_prefix}_dd_channel",
+                               help="Measurement channel to decompose; uses its |ρ| and raw phase shift")
     with col2:
         all_freqs = sorted({
             float(f) for name in files
@@ -1294,11 +1345,20 @@ def render_debye_decomposition_section(datasets: Dict[str, pd.DataFrame], key_pr
                                  "0.1 % in |ρ| and 0.1 mrad in phase")
         lam = None
         if lam_mode == "Manual":
-            lam = 10 ** st.slider("log10(λ)", -2.0, 10.0, 4.0, 0.5, key=f"{key_prefix}_dd_lam")
+            lam = 10 ** st.slider("log10(λ)", -2.0, 10.0, 4.0, 0.5, key=f"{key_prefix}_dd_lam",
+                                  help="Larger λ gives a smoother m(τ) but a worse fit; smaller λ fits "
+                                       "noise with spiky distributions")
         tau_per_decade = st.number_input("τ values per decade", min_value=5, max_value=40,
+                                         help="Density of the relaxation-time grid. 10 per decade "
+                                              "resolves the distribution; more only slows the fit.",
                                          value=DD_TAU_PER_DECADE, key=f"{key_prefix}_dd_tpd")
 
-    if not st.checkbox("Run Debye decomposition", key=f"{key_prefix}_dd_run"):
+    if not st.checkbox(
+        "Run Debye decomposition", key=f"{key_prefix}_dd_run",
+        help="Describes each spectrum as a sum of Debye relaxations with chargeabilities m_k at "
+             "relaxation times τ_k. Integral parameters summarise m(τ): total polarization (m_tot, "
+             "m_tot_n) and characteristic time scales (τ_mean, τ_50), related to grain/pore size."
+    ):
         return
 
     results = {}
@@ -1320,22 +1380,28 @@ def render_debye_decomposition_section(datasets: Dict[str, pd.DataFrame], key_pr
     )
     fit = results[(selected[0], selected[1])][selected[2]]
     st.plotly_chart(
-        create_dd_fit_figure(fit, f"{selected[0]} · {selected[1]} · Loop {selected[2]}"),
+        create_dd_fit_figure(fit, f"{selected[0]} · {selected[1]} · Loop {selected[2]}", page_is_dark()),
         use_container_width=True, config=get_plot_config(), theme=None
     )
     params = fit['parameters']
     metric_cols = st.columns(5)
-    metric_cols[0].metric("ρ0 (Ohm-m)", f"{params['rho0 (Ohm-m)']:.4g}")
-    metric_cols[1].metric("m_tot", f"{params['m_tot']:.4g}")
-    metric_cols[2].metric("τ_50 (s)", f"{params['tau_50 (s)']:.3g}")
-    metric_cols[3].metric("RMS |ρ| misfit", f"{params['RMS |rho| misfit (%)']:.3f} %")
-    metric_cols[4].metric("RMS phase misfit", f"{params['RMS phase misfit (mrad)']:.3f} mrad")
+    metric_cols[0].metric("ρ0 (Ω·m)", f"{params['rho0 (Ohm-m)']:.4g}", help=DD_PARAMETER_HELP['rho0 (Ohm-m)'])
+    metric_cols[1].metric("m_tot", f"{params['m_tot']:.4g}", help=DD_PARAMETER_HELP['m_tot'])
+    metric_cols[2].metric("τ_50 (s)", f"{params['tau_50 (s)']:.3g}", help=DD_PARAMETER_HELP['tau_50 (s)'])
+    metric_cols[3].metric("RMS |ρ| misfit", f"{params['RMS |rho| misfit (%)']:.3f} %",
+                          help=DD_PARAMETER_HELP['RMS |rho| misfit (%)'])
+    metric_cols[4].metric("RMS phase misfit", f"{params['RMS phase misfit (mrad)']:.3f} mrad",
+                          help=DD_PARAMETER_HELP['RMS phase misfit (mrad)'])
 
     st.markdown("**Integral parameters**")
     st.dataframe(table, hide_index=True, use_container_width=True,
-                 column_config=number_column_config(
-                     table.columns, exclude=['File', 'Channel', 'Loop', 'tau_peaks (s)', 'n_peaks', 'n_freqs']
-                 ))
+                 column_config={
+                     **number_column_config(
+                         table.columns, exclude=['File', 'Channel', 'Loop', 'tau_peaks (s)', 'n_peaks', 'n_freqs']
+                     ),
+                     **{c: st.column_config.Column(help=h) for c, h in DD_PARAMETER_HELP.items()
+                        if c in ('tau_peaks (s)', 'n_peaks', 'n_freqs')},
+                 })
     st.download_button(
         label="Download DD parameters (CSV)",
         data=table.to_csv(index=False).encode('utf-8'),
@@ -1350,6 +1416,7 @@ def render_debye_decomposition_section(datasets: Dict[str, pd.DataFrame], key_pr
 # ============================================================================
 PLOT_FONT_FAMILY = "Arial, Helvetica, sans-serif"
 DEFAULT_STYLE_PRESET = "Publication"
+DARK_STYLE_PRESET = "Publication (dark)"
 
 # Okabe & Ito (2008) colour-blind safe palette
 COLORBLIND_SAFE_PALETTE = [
@@ -1385,6 +1452,19 @@ def get_plot_config():
     }
 
 
+def page_is_dark() -> bool:
+    """True when the viewer has the dark app theme active (⋮ menu → Settings)."""
+    try:
+        return st.context.theme.type == 'dark'
+    except Exception:
+        return False
+
+
+def default_style_preset() -> str:
+    """Figure preset that matches the app theme."""
+    return DARK_STYLE_PRESET if page_is_dark() else DEFAULT_STYLE_PRESET
+
+
 def _to_hex(color: str) -> str:
     """Convert a Plotly 'rgb(r, g, b)' colour to '#rrggbb' (hex colours pass through)."""
     if color.startswith('#'):
@@ -1393,26 +1473,38 @@ def _to_hex(color: str) -> str:
     return f'#{r:02x}{g:02x}{b:02x}'
 
 
-def palette_colors(palette: str, n: int) -> List[str]:
-    """n hex colours from a named palette; sequential palettes spread over their range."""
+def palette_colors(palette: str, n: int, dark: bool = False) -> List[str]:
+    """n hex colours from a named palette; sequential palettes spread over their range.
+
+    With dark=True, black/dark entries are swapped for light ones so lines stay visible
+    on a dark background.
+    """
     if n <= 0:
         return []
     positions = [i / max(n - 1, 1) for i in range(n)]
     if palette == 'Viridis (sequential)':
-        return [_to_hex(c) for c in px.colors.sample_colorscale('Viridis', [0.9 * p for p in positions])]
+        # Skip the end of viridis that vanishes on the background (yellow on white, purple on dark)
+        start, end = (0.25, 1.0) if dark else (0.0, 0.9)
+        return [_to_hex(c) for c in px.colors.sample_colorscale(
+            'Viridis', [start + (end - start) * p for p in positions])]
     if palette == 'Greyscale':
-        return [_to_hex(c) for c in px.colors.sample_colorscale([[0, 'rgb(0,0,0)'], [1, 'rgb(180,180,180)']], positions)]
+        ends = [[0, 'rgb(255,255,255)'], [1, 'rgb(110,110,110)']] if dark else \
+               [[0, 'rgb(0,0,0)'], [1, 'rgb(180,180,180)']]
+        return [_to_hex(c) for c in px.colors.sample_colorscale(ends, positions)]
     colors = px.colors.qualitative.Plotly if palette == 'Plotly' else COLORBLIND_SAFE_PALETTE
+    if dark:
+        colors = ['#FFFFFF' if c == '#000000' else c for c in colors]
     return [colors[i % len(colors)] for i in range(n)]
 
 
-def get_line_colors_ui(trace_names: List[str], palette: str, key_prefix: str = "") -> Dict[str, str]:
+def get_line_colors_ui(trace_names: List[str], palette: str, key_prefix: str = "",
+                       dark: bool = False) -> Dict[str, str]:
     """Colours from the chosen palette, with optional per-line overrides."""
-    colors = dict(zip(trace_names, palette_colors(palette, len(trace_names))))
+    colors = dict(zip(trace_names, palette_colors(palette, len(trace_names), dark)))
     if trace_names and st.checkbox("Set colours per line", key=f"{key_prefix}_custom_colors"):
         for idx, name in enumerate(trace_names):
             colors[name] = st.color_picker(
-                name[:40], value=colors[name], key=f"{key_prefix}_line_{idx}_{palette}"
+                name[:40], value=colors[name], key=f"{key_prefix}_line_{idx}_{palette}_{dark}"
             )
     return colors
 
@@ -1441,6 +1533,24 @@ def get_research_presets():
             'line_width': 2,
             'marker_size': 6,
             'description': 'White background, boxed axes, light grid'
+        },
+        "Publication (dark)": {
+            'plot_bgcolor': '#0E1117',
+            'paper_bgcolor': '#0E1117',
+            'title_color': '#E6E8EB',
+            'axis_color': '#E6E8EB',
+            'legend_text_color': '#E6E8EB',
+            'grid_color': '#3A4150',
+            'grid_opacity': 0.8,
+            'zeroline_color': '#6B7380',
+            'zeroline_opacity': 0.8,
+            'legend_bgcolor': '#0E1117',
+            'legend_bg_opacity': 0.8,
+            'legend_border_color': '#6B7380',
+            'legend_border_width': 1,
+            'line_width': 2,
+            'marker_size': 6,
+            'description': 'Boxed axes on the dark app background, for screen work'
         },
         "Nature/Science": {
             'plot_bgcolor': '#FFFFFF',
@@ -1706,14 +1816,21 @@ def get_style_ui(key_prefix: str = "") -> Tuple[Dict, str, Dict, Dict]:
         Tuple of (style_config, palette name, font_config, legend_config)
     """
     presets = get_research_presets()
+    default_preset = default_style_preset()
     preset_name = st.selectbox(
-        "Style preset", options=list(presets), index=list(presets).index(DEFAULT_STYLE_PRESET),
-        key=f"{key_prefix}_preset_select"
+        "Style preset", options=list(presets), index=list(presets).index(default_preset),
+        # The key includes the default so the preset follows a light/dark theme switch
+        key=f"{key_prefix}_preset_select_{default_preset}",
+        help="Publication: white figure with boxed axes for print. Publication (dark): the same on "
+             "the dark app background. The journal presets follow typical author guidelines. "
+             "Exported files use exactly the style shown."
     )
     style_config = presets[preset_name].copy()
     st.caption(style_config.pop('description'))
     palette = st.selectbox("Line palette", options=PALETTES, key=f"{key_prefix}_palette",
-                           help="Colour-blind safe: Okabe & Ito (2008). Viridis suits ordered loops.")
+                           help="Colour-blind safe: Okabe & Ito (2008), readable with all common colour "
+                                "vision deficiencies. Viridis: perceptually uniform sequence, suited to "
+                                "ordered loops (e.g. a time series). Greyscale: for black-and-white print.")
     if st.checkbox("Adjust colours and lines", key=f"{key_prefix}_override"):
         style_config = get_style_overrides_ui(key_prefix, style_config, preset_name)
 
@@ -1874,7 +1991,8 @@ def get_loop_selection_ui(datasets: Dict[str, pd.DataFrame], key_prefix: str) ->
         label = "Loops" if len(datasets) == 1 else f"Loops · {name}"
         selected_loops[name] = st.multiselect(
             label, options=loops, default=loops, key=f"{key_prefix}_loops_{name}",
-            help="Measurement loops to plot"
+            help="Repeated frequency sweeps within one file. Loops that overlap indicate a stable, "
+                 "reproducible measurement."
         )
     return selected_loops
 
@@ -1885,7 +2003,7 @@ def render_spectra_tab(datasets: Dict[str, pd.DataFrame], key_prefix: str):
     with col_ctrl:
         if len(datasets) > 1:
             names = st.multiselect("Files", options=list(datasets), default=list(datasets),
-                                   key=f"{key_prefix}_files")
+                                   key=f"{key_prefix}_files", help="Files shown in the figure")
             datasets = {name: datasets[name] for name in names}
         if not datasets:
             st.warning("Select at least one file.")
@@ -1893,8 +2011,11 @@ def render_spectra_tab(datasets: Dict[str, pd.DataFrame], key_prefix: str):
         first = next(iter(datasets.values()))
         common_cols = [c for c in first.columns if all(c in df.columns for df in datasets.values())]
 
-        plot_mode = st.radio("Plot", ["SIP two-panel", "Custom X / Y"], horizontal=True,
-                             key=f"{key_prefix}_plot_mode")
+        plot_mode = st.radio(
+            "Plot", ["SIP two-panel", "Custom X / Y"], horizontal=True, key=f"{key_prefix}_plot_mode",
+            help="SIP two-panel: the standard SIP figure, phase −φ above a magnitude or conductivity "
+                 "quantity on a shared log-frequency axis. Custom X / Y: any two quantities."
+        )
         two_panel = get_two_panel_settings_ui(common_cols, key_prefix) if plot_mode == "SIP two-panel" else None
         plot_type = 'overlay'
         if two_panel is None:
@@ -1904,19 +2025,29 @@ def render_spectra_tab(datasets: Dict[str, pd.DataFrame], key_prefix: str):
                 return
             freq_col = find_frequency_column(numeric_cols)
             default_y = next((c for c in numeric_cols if c.endswith(PHASE_QUANTITY)), numeric_cols[-1])
+            quantity_help = ("Quantities are shown with symbol and unit; exported CSV files keep "
+                             "the original column names. −φ is the phase in mrad, positive for a "
+                             "capacitive (polarizing) response.")
             x_axis = st.selectbox("X axis", options=numeric_cols, format_func=display_name,
                                   index=numeric_cols.index(freq_col) if freq_col else 0,
-                                  key=f"{key_prefix}_x")
+                                  key=f"{key_prefix}_x", help=quantity_help)
             y_axis = st.selectbox("Y axis", options=numeric_cols, format_func=display_name,
-                                  index=numeric_cols.index(default_y), key=f"{key_prefix}_y")
+                                  index=numeric_cols.index(default_y), key=f"{key_prefix}_y",
+                                  help=quantity_help)
             if len(datasets) > 1:
                 plot_type = st.radio("Layout", ["overlay", "subplots"], horizontal=True,
                                      format_func=lambda x: "Overlay" if x == "overlay" else "One panel per file",
-                                     key=f"{key_prefix}_plot_type")
+                                     key=f"{key_prefix}_plot_type",
+                                     help="Overlay: all files in one panel. One panel per file: "
+                                          "stacked panels with the same quantities.")
         log_cols = st.columns(2)
-        log_x = log_cols[0].checkbox("Log x", value=True, key=f"{key_prefix}_log_x")
+        log_x = log_cols[0].checkbox("Log x", value=True, key=f"{key_prefix}_log_x",
+                                     help="Logarithmic frequency axis, standard for spectra that span "
+                                          "several decades")
         log_y = log_cols[1].checkbox("Log lower y" if two_panel else "Log y", value=False,
-                                     key=f"{key_prefix}_log_y")
+                                     key=f"{key_prefix}_log_y",
+                                     help="Logarithmic y axis for quantities spanning orders of magnitude "
+                                          "(|ρ|, σ). Not suited to phase, which can be zero or negative.")
         selected_loops = get_loop_selection_ui(datasets, key_prefix)
 
         with st.expander("Labels"):
@@ -1936,6 +2067,7 @@ def render_spectra_tab(datasets: Dict[str, pd.DataFrame], key_prefix: str):
                 }, key_prefix)
         with st.expander("Style"):
             style_config, palette, font_config, legend_config = get_style_ui(key_prefix)
+            dark_figure = style_config['plot_bgcolor'].upper() in ('#000000', '#0E1117')
 
         # Fluid calibration check applies when phase is plotted against frequency
         if two_panel:
@@ -1974,7 +2106,7 @@ def render_spectra_tab(datasets: Dict[str, pd.DataFrame], key_prefix: str):
     trace_names = list(dict.fromkeys(trace.name for trace in fig.data))
     with col_ctrl:
         with st.expander("Line colours"):
-            line_colors = get_line_colors_ui(trace_names, palette, key_prefix)
+            line_colors = get_line_colors_ui(trace_names, palette, key_prefix, dark_figure)
 
     fig = apply_style_to_figure(fig, style_config, line_colors, font_config, legend_config)
     if fluid:
@@ -2029,35 +2161,54 @@ def main():
 
     with st.sidebar:
         st.header("Data")
-        mode = st.radio("Analysis mode", ["Single file", "Compare files"], horizontal=True)
+        mode = st.radio("Analysis mode", ["Single file", "Compare files"], horizontal=True,
+                        help="Single file: analyse one measurement. Compare files: plot several "
+                             "measurements together, each with its own sample geometry.")
         uploaded_files = st.file_uploader(
             "SIP files", type=["csv", "txt"], accept_multiple_files=True
         )
         active_file = None
         if mode == "Single file" and uploaded_files and len(uploaded_files) > 1:
-            active_file = st.selectbox("Active file", options=[f.name for f in uploaded_files])
+            active_file = st.selectbox("Active file", options=[f.name for f in uploaded_files],
+                                       help="File analysed in single-file mode")
 
         st.header("Sample & instrument")
-        sample_length = st.number_input("Sample length L (m)", value=DEFAULT_SAMPLE_LENGTH, format="%.4f")
-        size_input = st.radio("Cross-section", ["Area", "Diameter"], horizontal=True)
+        sample_length = st.number_input(
+            "Sample length L (m)", value=DEFAULT_SAMPLE_LENGTH, format="%.4f",
+            help="Distance between the potential electrodes. Resistivity ρ = R·A/L."
+        )
+        size_input = st.radio("Cross-section", ["Area", "Diameter"], horizontal=True,
+                              help="Enter the cross-section as an area, or as the inner diameter of "
+                                   "a cylindrical holder (A = π(d/2)²)")
         if size_input == "Diameter":
             sample_diameter = st.number_input(
-                "Diameter d (m)", value=DEFAULT_SAMPLE_DIAMETER, format="%.4f", min_value=0.0
+                "Diameter d (m)", value=DEFAULT_SAMPLE_DIAMETER, format="%.4f", min_value=0.0,
+                help="Inner diameter of the cylindrical sample holder"
             )
             sample_area = area_from_diameter(sample_diameter)
             st.caption(f"A = π(d/2)² = {sample_area:.6f} m²")
         else:
             sample_diameter = None
-            sample_area = st.number_input("Area A (m²)", value=DEFAULT_SAMPLE_AREA, format="%.6f")
+            sample_area = st.number_input("Area A (m²)", value=DEFAULT_SAMPLE_AREA, format="%.6f",
+                                          help="Cross-sectional area of the sample, perpendicular "
+                                               "to the current flow")
         global_geometry = {'length': sample_length, 'area': sample_area, 'diameter': sample_diameter}
         manual_ref = st.number_input("Reference resistor R_ref (Ω)", value=0.0,
-                                     help="0 uses the value in each file header")
+                                     help="Resistor in series with the sample; the instrument measures "
+                                          "|Z|/R_ref, so R = ratio × R_ref. 0 uses the value in each "
+                                          "file header (Current Resistor[Ohms]).")
         magnitude_unit_choice = st.selectbox(
             "Magnitude unit",
             options=["Auto-detect", "ratio", "dB"],
             help="Auto-detect reads the column unit (Magnitude[ratio] / Magnitude[dB]) "
-                 "or the 'Writer_Version,2' header, which stores magnitude in dB."
+                 "or the 'Writer_Version,2' header, which stores magnitude in dB "
+                 "(ratio = 10^(dB/20))."
         )
+
+        st.header("Appearance")
+        st.caption("Switch between light and dark in the ⋮ menu (top right) → Settings → "
+                   "Choose app theme. Figures follow the theme; any figure style can be picked "
+                   "under Spectra → Style.")
 
     if not uploaded_files:
         render_about()
@@ -2119,7 +2270,13 @@ def main():
 
         with summary_box:
             st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True,
-                         column_config=number_column_config(["R_ref (Ω)", "L (m)", "A (m²)"]))
+                         column_config={
+                             **number_column_config(["R_ref (Ω)", "L (m)", "A (m²)"]),
+                             "Magnitude": st.column_config.Column(
+                                 help="Unit of the stored magnitude: ratio |Z|/R_ref, or dB = 20·log10(ratio)"),
+                             "Loops": st.column_config.Column(help="Repeated frequency sweeps in the file"),
+                             "Channels": st.column_config.Column(help="Channels with magnitude and phase data"),
+                         })
 
         if mode == "Single file":
             analysed = active_file if active_file in processed_datasets else next(iter(processed_datasets))
