@@ -49,7 +49,7 @@ WRITER_VERSION_PATTERN = re.compile(r'^\s*Writer_Version\s*[,\t]\s*2\b', re.IGNO
 
 # Page configuration
 st.set_page_config(
-    page_title="SDAT The SIP Data Analyzer Tool",
+    page_title="SDAT · SIP Data Analysis Tool",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -647,7 +647,8 @@ def create_comparison_plot(datasets: Dict[str, pd.DataFrame], x_col: str, y_col:
                         loop_data = df[df['Loop'] == loop]
                         fig.add_trace(go.Scatter(
                             x=loop_data[x_col], y=loop_data[y_col],
-                            mode='lines+markers', name=f"{name} - L{loop}",
+                            mode='lines+markers',
+                            name=f"Loop {loop}" if len(datasets) == 1 else f"{name} - L{loop}",
                             line=dict(color=line_color), marker=dict(size=6)
                         ))
                 else:
@@ -719,6 +720,47 @@ SIP_BOTTOM_QUANTITIES = [
 ]
 
 
+# Display names and symbols for the data columns (the columns themselves keep their names)
+QUANTITY_LABELS = {
+    'Frequency[Hz]': ('Frequency', 'f (Hz)'),
+    'Magnitude[ratio]': ('Impedance ratio', '|Z|/R_ref'),
+    'Magnitude[dB]': ('Impedance ratio', '|Z|/R_ref (dB)'),
+    'Magnitude': ('Impedance ratio', '|Z|/R_ref'),
+    'Phase_Shift[rad]': ('Phase shift', 'φ (rad)'),
+    'Resistance (Ohms)': ('Resistance', '|R| (Ω)'),
+    'Resistivity (Ohm-m)': ('Resistivity', '|ρ| (Ω·m)'),
+    'Fluid Conductivity (uS/cm)': ('Conductivity', 'σ (µS/cm)'),
+    'Cell Constant K': ('Cell constant', 'K'),
+    'Phase (mRads)': ('Phase', '−φ (mrad)'),
+    'Real Conductivity (S/m)': ('Real conductivity', "σ′ (S/m)"),
+    'Imaginary Conductivity (S/m)': ('Imaginary conductivity', "σ″ (S/m)"),
+    'Imaginary Conductivity (uS/cm)': ('Imaginary conductivity', "σ″ (µS/cm)"),
+}
+CHANNEL_PATTERN = re.compile(r'^(Chan-\d+)\s+(.+)$')
+
+
+def split_channel(column: str) -> Tuple[str, str]:
+    """Split 'Chan-1 Resistivity (Ohm-m)' into ('Chan-1', 'Resistivity (Ohm-m)')."""
+    match = CHANNEL_PATTERN.match(str(column))
+    return (match.group(1), match.group(2)) if match else ('', str(column))
+
+
+def display_name(column: str) -> str:
+    """Selector label, e.g. 'Chan-1 · Resistivity |ρ| (Ω·m)'; unknown columns are unchanged."""
+    channel, quantity = split_channel(column)
+    if quantity not in QUANTITY_LABELS:
+        return str(column)
+    name, symbol = QUANTITY_LABELS[quantity]
+    label = f"{name} {symbol}"
+    return f"{channel} · {label}" if channel else label
+
+
+def axis_label(column: str) -> str:
+    """Axis label with symbol and unit, e.g. '|ρ| (Ω·m)'; unknown columns are unchanged."""
+    _, quantity = split_channel(column)
+    return QUANTITY_LABELS[quantity][1] if quantity in QUANTITY_LABELS else str(column)
+
+
 def channel_column(channel: str, quantity: str) -> str:
     """Column name for a channel quantity, e.g. ('Chan-1', 'Phase (mRads)')."""
     return f"{channel} {quantity}" if channel else quantity
@@ -760,7 +802,7 @@ def create_sip_two_panel_plot(datasets: Dict[str, pd.DataFrame], channel: str,
     bottom_col = channel_column(channel, bottom_quantity)
     
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06)
-    palette = px.colors.qualitative.Plotly
+    palette = COLORBLIND_SAFE_PALETTE
     datasets = {name: df for name, df in datasets.items()
                 if {freq_col, phase_col, bottom_col}.issubset(df.columns)}
     for idx, (trace_name, df) in enumerate(iter_loop_traces(datasets, selected_loops)):
@@ -774,19 +816,20 @@ def create_sip_two_panel_plot(datasets: Dict[str, pd.DataFrame], channel: str,
         fig.add_trace(go.Scatter(y=df[bottom_col], showlegend=False, **common), row=2, col=1)
     
     fig.update_xaxes(type='log' if log_x else 'linear')
-    fig.update_xaxes(title_text=x_label or freq_col, row=2, col=1)
-    fig.update_yaxes(title_text=top_label or phase_col, row=1, col=1)
-    fig.update_yaxes(title_text=bottom_label or bottom_col,
+    fig.update_xaxes(title_text=x_label or axis_label(freq_col), row=2, col=1)
+    fig.update_yaxes(title_text=top_label or axis_label(phase_col), row=1, col=1)
+    fig.update_yaxes(title_text=bottom_label or axis_label(bottom_col),
                      type='log' if log_y_bottom else 'linear', row=2, col=1)
     fig.update_layout(
-        title=dict(text=title or f"{channel} SIP spectrum".strip(), x=0.5, xanchor='center', font=dict(size=16)),
+        title=dict(text=title if title is not None else f"{channel} SIP spectrum".strip(),
+                   x=0.5, xanchor='center', font=dict(size=16)),
         height=750, hovermode='closest'
     )
     return fig
 
 
 def get_two_panel_settings_ui(columns: List[str], key_prefix: str = "") -> Optional[Dict[str, str]]:
-    """Sidebar-column UI for the two-panel plot. Returns None when no phase data exists."""
+    """Channel and bottom-panel selection for the two-panel plot. None when no phase data exists."""
     channels = get_phase_channels(columns)
     if not channels:
         st.warning("No phase data available for a two-panel SIP plot.")
@@ -794,21 +837,27 @@ def get_two_panel_settings_ui(columns: List[str], key_prefix: str = "") -> Optio
     channel = st.selectbox("Channel", options=channels, key=f"{key_prefix}_tp_channel")
     quantities = [q for q in SIP_BOTTOM_QUANTITIES if channel_column(channel, q) in columns]
     bottom_quantity = st.selectbox(
-        "Bottom panel", options=quantities, key=f"{key_prefix}_tp_bottom",
+        "Lower panel", options=quantities, key=f"{key_prefix}_tp_bottom",
+        format_func=display_name,
         help="Magnitude or conductivity quantity plotted below the phase"
     )
-    freq_col = find_frequency_column(columns)
-    st.markdown("---")
-    st.markdown("**Customize Labels:**")
-    # Label keys include the selection so defaults follow channel/quantity changes
     return {
         'channel': channel,
         'bottom_quantity': bottom_quantity,
-        'freq_col': freq_col,
-        'title': st.text_input("Plot Title", value=f"{channel} SIP spectrum", key=f"{key_prefix}_tp_title_{channel}"),
-        'x_label': st.text_input("X-Axis Label", value="Frequency (Hz)", key=f"{key_prefix}_tp_xlabel"),
-        'top_label': st.text_input("Top Y-Axis Label", value="Phase (mrad)", key=f"{key_prefix}_tp_toplabel"),
-        'bottom_label': st.text_input("Bottom Y-Axis Label", value=bottom_quantity, key=f"{key_prefix}_tp_bottomlabel_{bottom_quantity}"),
+        'freq_col': find_frequency_column(columns),
+    }
+
+
+def get_labels_ui(defaults: Dict[str, str], key_prefix: str) -> Dict[str, str]:
+    """Editable figure title and axis labels.
+
+    Args:
+        defaults: Mapping of field -> default text, e.g. {'Title': ..., 'X axis': ...}
+    """
+    # Keys include the default so labels follow changes of the plotted quantity
+    return {
+        field: st.text_input(field, value=default, key=f"{key_prefix}_label_{field}_{default}")
+        for field, default in defaults.items()
     }
 
 
@@ -891,32 +940,33 @@ def add_fluid_phase_overlay(fig: go.Figure, freq_min: float, freq_max: float,
 
 def get_fluid_calibration_ui(phase_channel: Optional[str], default_sigma_uscm: float,
                              key_suffix: str) -> Optional[Dict[str, float]]:
-    """Sidebar section for the fluid calibration check. Returns settings when enabled."""
-    with st.sidebar:
-        st.header("3. Fluid Calibration Check")
-        enabled = st.checkbox(
-            "Overlay theoretical fluid phase", key="fluid_check_enabled",
-            help="For calibration/QC measurements on water: φ = arctan(ε_r·ε0·ω/σ)"
-        )
-        if not enabled:
-            return None
-        if phase_channel is None:
-            st.info("Plot a Phase (mRads) column against frequency, or use the SIP two-panel plot, "
-                    "to see the overlay.")
-            return None
-        if not np.isfinite(default_sigma_uscm) or default_sigma_uscm <= 0:
-            default_sigma_uscm = 1000.0
-        sigma = st.number_input(
-            "Fluid conductivity (µS/cm)", min_value=0.001, value=float(round(default_sigma_uscm, 2)),
-            format="%.2f", key=f"fluid_sigma_{key_suffix}",
-            help="Defaults to the measured low-frequency Fluid Conductivity of the plotted channel"
-        )
-        eps_r = st.number_input("Relative permittivity ε_r", min_value=1.0,
-                                value=WATER_RELATIVE_PERMITTIVITY, key="fluid_eps_r")
-        tolerance = st.number_input("Tolerance band (± mrad)", min_value=0.0,
-                                    value=DEFAULT_FLUID_TOLERANCE_MRAD, step=0.01,
-                                    format="%.3f", key="fluid_tolerance")
+    """Controls for the fluid calibration check. Returns settings when enabled."""
+    st.caption("For calibration/QC measurements on water: φ(ω) = arctan(ε_r·ε0·ω/σ)")
+    enabled = st.checkbox("Overlay theoretical fluid phase", key="fluid_check_enabled")
+    if not enabled:
+        return None
+    if phase_channel is None:
+        st.info("Plot phase −φ (mrad) against frequency, or use the SIP two-panel plot, "
+                "to see the overlay.")
+        return None
+    if not np.isfinite(default_sigma_uscm) or default_sigma_uscm <= 0:
+        default_sigma_uscm = 1000.0
+    sigma = st.number_input(
+        "Fluid conductivity σ (µS/cm)", min_value=0.001, value=float(round(default_sigma_uscm, 2)),
+        format="%.2f", key=f"fluid_sigma_{key_suffix}",
+        help="Defaults to the measured low-frequency conductivity of the plotted channel"
+    )
+    eps_r = st.number_input("Relative permittivity ε_r", min_value=1.0,
+                            value=WATER_RELATIVE_PERMITTIVITY, key="fluid_eps_r")
+    tolerance = st.number_input("Tolerance band (± mrad)", min_value=0.0,
+                                value=DEFAULT_FLUID_TOLERANCE_MRAD, step=0.01,
+                                format="%.3f", key="fluid_tolerance")
     return {'sigma': sigma, 'eps_r': eps_r, 'tolerance': tolerance, 'channel': phase_channel}
+
+
+def number_column_config(columns, exclude=(), fmt: str = "%.4g") -> Dict:
+    """st.dataframe column_config showing numbers to 4 significant figures."""
+    return {c: st.column_config.NumberColumn(format=fmt) for c in columns if c not in exclude}
 
 
 def show_fluid_deviation_table(datasets: Dict[str, pd.DataFrame], freq_col: str,
@@ -931,9 +981,10 @@ def show_fluid_deviation_table(datasets: Dict[str, pd.DataFrame], freq_col: str,
                 df[freq_col], df[phase_col], fluid['sigma'], fluid['eps_r'], fluid['tolerance']
             )})
     if rows:
-        st.markdown(f"**Fluid calibration check** ({phase_col} vs theory for "
-                    f"{fluid['sigma']:g} µS/cm, ε_r = {fluid['eps_r']:g})")
-        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        st.markdown(f"**Fluid calibration check**: {display_name(phase_col)} against theory for "
+                    f"σ = {fluid['sigma']:g} µS/cm, ε_r = {fluid['eps_r']:g}")
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True,
+                     column_config=number_column_config(rows[0], exclude=['Spectrum']))
 
 
 # ============================================================================
@@ -1164,8 +1215,8 @@ def create_dd_fit_figure(fit: Dict, title: str) -> go.Figure:
     freq = fit['freq']
     dense_freq = np.logspace(np.log10(freq.min()), np.log10(freq.max()), 200)
     model = dd_forward(dense_freq, fit['rho0'], fit['m'], fit['tau'])
-    measured = dict(mode='markers', marker=dict(size=7, color='#636EFA'), legendgroup='measured')
-    fitted = dict(mode='lines', line=dict(width=2, color='#EF553B'), legendgroup='fitted')
+    measured = dict(mode='markers', marker=dict(size=7, color='#000000'), legendgroup='measured')
+    fitted = dict(mode='lines', line=dict(width=2, color='#D55E00'), legendgroup='fitted')
     fig.add_trace(go.Scatter(x=freq, y=-fit['phase_rad'] * 1000, name='Measured', **measured), row=1, col=1)
     fig.add_trace(go.Scatter(x=dense_freq, y=-np.angle(model) * 1000, name='DD fit', **fitted), row=1, col=1)
     fig.add_trace(go.Scatter(x=freq, y=fit['rho_magnitude'], name='Measured', showlegend=False, **measured),
@@ -1174,27 +1225,32 @@ def create_dd_fit_figure(fit: Dict, title: str) -> go.Figure:
                   row=2, col=1)
     fig.add_trace(go.Scatter(
         x=fit['tau'], y=fit['m'], mode='lines+markers', name='m(τ)',
-        line=dict(color='#00CC96'), marker=dict(size=4)
+        line=dict(color='#0072B2'), marker=dict(size=4)
     ), row=1, col=2)
     params = fit['parameters']
-    for key, dash in (('tau_50 (s)', 'dash'), ('tau_mean (s)', 'dot')):
+    for key, label, dash, position in (('tau_50 (s)', 'τ<sub>50</sub>', 'dash', 'top left'),
+                                       ('tau_mean (s)', 'τ<sub>mean</sub>', 'dot', 'top right')):
         if np.isfinite(params[key]):
             fig.add_vline(x=params[key], line=dict(dash=dash, color='gray'), row=1, col=2,
-                          annotation_text=key.replace(' (s)', ''), annotation_position='bottom right')
+                          annotation_text=label, annotation_position=position)
     fig.update_xaxes(type='log')
-    fig.update_xaxes(title_text='Frequency (Hz)', row=2, col=1)
+    fig.update_xaxes(title_text='f (Hz)', row=2, col=1)
     fig.update_xaxes(title_text='τ (s)', row=1, col=2)
-    fig.update_yaxes(title_text='Phase (mrad)', row=1, col=1)
-    fig.update_yaxes(title_text='|ρ| (Ohm-m)', row=2, col=1)
+    fig.update_yaxes(title_text='−φ (mrad)', row=1, col=1)
+    fig.update_yaxes(title_text='|ρ| (Ω·m)', row=2, col=1)
     fig.update_yaxes(title_text='m', row=1, col=2)
     fig.update_layout(title=dict(text=title, x=0.5, xanchor='center'), height=650)
+    style = get_research_presets()[DEFAULT_STYLE_PRESET]
+    legend = {'show': True, 'title': '', 'orientation': 'h', **LEGEND_POSITIONS['outside-bottom']}
+    fig = apply_style_to_figure(fig, style, None, None, legend)
+    # apply_style sets one line width / marker size for all traces; keep the measured points visible
+    fig.update_traces(marker=dict(size=7), selector=dict(mode='markers'))
+    fig.update_traces(marker=dict(size=4), selector=dict(mode='lines+markers'))
     return fig
 
 
 def render_debye_decomposition_section(datasets: Dict[str, pd.DataFrame], key_prefix: str):
     """Debye decomposition UI: settings, per-spectrum fit plot, parameter table and CSV export."""
-    st.divider()
-    st.subheader("Debye Decomposition")
     st.caption(
         "Fits ρ(ω) = ρ0·[1 − Σ m_k·(1 − 1/(1 + iωτ_k))] to each spectrum on a log-spaced τ grid "
         "(measured range ± 1 decade) with a smoothness-regularised non-negative least-squares fit, "
@@ -1265,7 +1321,7 @@ def render_debye_decomposition_section(datasets: Dict[str, pd.DataFrame], key_pr
     fit = results[(selected[0], selected[1])][selected[2]]
     st.plotly_chart(
         create_dd_fit_figure(fit, f"{selected[0]} · {selected[1]} · Loop {selected[2]}"),
-        use_container_width=True, config=get_plot_config()
+        use_container_width=True, config=get_plot_config(), theme=None
     )
     params = fit['parameters']
     metric_cols = st.columns(5)
@@ -1276,7 +1332,10 @@ def render_debye_decomposition_section(datasets: Dict[str, pd.DataFrame], key_pr
     metric_cols[4].metric("RMS phase misfit", f"{params['RMS phase misfit (mrad)']:.3f} mrad")
 
     st.markdown("**Integral parameters**")
-    st.dataframe(table, hide_index=True, use_container_width=True)
+    st.dataframe(table, hide_index=True, use_container_width=True,
+                 column_config=number_column_config(
+                     table.columns, exclude=['File', 'Channel', 'Loop', 'tau_peaks (s)', 'n_peaks', 'n_freqs']
+                 ))
     st.download_button(
         label="Download DD parameters (CSV)",
         data=table.to_csv(index=False).encode('utf-8'),
@@ -1287,12 +1346,31 @@ def render_debye_decomposition_section(datasets: Dict[str, pd.DataFrame], key_pr
 
 
 # ============================================================================
-#PLOT CONFIGURATION HELPER
+# PLOT STYLE, COLOURS AND EXPORT
 # ============================================================================
+PLOT_FONT_FAMILY = "Arial, Helvetica, sans-serif"
+DEFAULT_STYLE_PRESET = "Publication"
+
+# Okabe & Ito (2008) colour-blind safe palette
+COLORBLIND_SAFE_PALETTE = [
+    '#0072B2', '#E69F00', '#009E73', '#CC79A7', '#D55E00', '#56B4E9', '#F0E442', '#000000'
+]
+PALETTES = ['Colour-blind safe', 'Plotly', 'Viridis (sequential)', 'Greyscale']
+
+DEFAULT_FONT_CONFIG = {'title_size': 16, 'axis_label_size': 14, 'tick_size': 12, 'legend_size': 12}
+LEGEND_POSITIONS = {
+    "top-left": {"x": 0.01, "y": 0.99, "xanchor": "left", "yanchor": "top"},
+    "top-right": {"x": 0.99, "y": 0.99, "xanchor": "right", "yanchor": "top"},
+    "bottom-left": {"x": 0.01, "y": 0.01, "xanchor": "left", "yanchor": "bottom"},
+    "bottom-right": {"x": 0.99, "y": 0.01, "xanchor": "right", "yanchor": "bottom"},
+    "outside-right": {"x": 1.02, "y": 1.0, "xanchor": "left", "yanchor": "top"},
+    "outside-bottom": {"x": 0.5, "y": -0.15, "xanchor": "center", "yanchor": "top"},
+}
+
+
 def get_plot_config():
-    """Return Plotly config wit editability enabled."""
+    """Plotly toolbar config: hi-res PNG download, drawing tools, no logo."""
     return {
-        'editable': True,
         'toImageButtonOptions': {
             'format': 'png',
             'filename': 'sip_plot',
@@ -1304,300 +1382,66 @@ def get_plot_config():
         'modeBarButtonsToAdd': [
             'drawline', 'drawopenpath', 'drawclosedpath', 'drawcircle', 'drawrect', 'eraseshape'
         ],
-        'modeBarButtonsToRemove': []
     }
 
 
-def get_line_color_customization(traces, key_prefix=""):
-    """Create UI for individual line color customization.
-    
-    Args:
-        traces: List of trace names/identifiers
-        key_prefix: Prefix for widget keys
-        
-    Returns:
-        Dictionary mapping trace names to colors
-    """
-    st.markdown("**🎨 Individual Line Colors:**")
-    
-    # Default color palette
-    default_colors = [
-        '#636EFA', '#EF553B', '#00CC96', '#AB63FA', '#FFA15A',
-        '#19D3F3', '#FF6692', '#B6E880', '#FF97FF', '#FECB52'
-    ]
-    
-    color_map = {}
-    
-    # Create color pickers for each trace
-    for idx, trace_name in enumerate(traces):
-        default_color = default_colors[idx % len(default_colors)]
-        color = st.color_picker(
-            f"Line {idx + 1}: {trace_name[:30]}",
-            value=default_color,
-            key=f"{key_prefix}_line_{idx}"
-        )
-        color_map[trace_name] = color
-    
-    return color_map
+def _to_hex(color: str) -> str:
+    """Convert a Plotly 'rgb(r, g, b)' colour to '#rrggbb' (hex colours pass through)."""
+    if color.startswith('#'):
+        return color
+    r, g, b = (int(round(float(v))) for v in color[color.index('(') + 1:color.index(')')].split(',')[:3])
+    return f'#{r:02x}{g:02x}{b:02x}'
 
 
-def get_plot_style_customization(key_prefix=""):
-    """Create UI for plot style customization.
-    
-    Args:
-        key_prefix: Prefix for widget keys
-        
-    Returns:
-        Dictionary with style settings
-    """
-    st.markdown("**🎨 Plot Style:**")
-    
-    with st.expander("📊 Background Colors"):
-        col1, col2 = st.columns(2)
-        with col1:
-            plot_bg = st.color_picker(
-                "Plot Background",
-                value="#000000",
-                help="Background inside plot area",
-                key=f"{key_prefix}_plot_bg"
-            )
-        with col2:
-            paper_bg = st.color_picker(
-                "Paper Background",
-                value="#000000",
-                help="Background outside plot area",
-                key=f"{key_prefix}_paper_bg"
-            )
-    
-    with st.expander("✏️ Text Colors"):
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            title_color = st.color_picker(
-                "Title",
-                value="#FFFFFF",
-                key=f"{key_prefix}_title_color"
-            )
-        with col2:
-            axis_color = st.color_picker(
-                "Axis Labels",
-                value="#FFFFFF",
-                key=f"{key_prefix}_axis_color"
-            )
-        with col3:
-            legend_color = st.color_picker(
-                "Legend",
-                value="#FFFFFF",
-                key=f"{key_prefix}_legend_color"
-            )
-    
-    with st.expander("📐 Grid & Lines"):
-        col1, col2 = st.columns(2)
-        with col1:
-            grid_color = st.color_picker(
-                "Grid Color",
-                value="#808080",
-                key=f"{key_prefix}_grid"
-            )
-            grid_opacity = st.slider(
-                "Grid Opacity",
-                0.0, 1.0, 0.3, 0.1,
-                key=f"{key_prefix}_grid_opacity"
-            )
-        with col2:
-            zeroline_color = st.color_picker(
-                "Zero Line",
-                value="#808080",
-                key=f"{key_prefix}_zeroline"
-            )
-            zeroline_opacity = st.slider(
-                "Zero Line Opacity",
-                0.0, 1.0, 0.5, 0.1,
-                key=f"{key_prefix}_zeroline_opacity"
-            )
-    
-    with st.expander("📦 Legend Style"):
-        col1, col2 = st.columns(2)
-        with col1:
-            legend_bg = st.color_picker(
-                "Background",
-                value="#000000",
-                key=f"{key_prefix}_legend_bg"
-            )
-            legend_bg_opacity = st.slider(
-                "BG Opacity",
-                0.0, 1.0, 0.8, 0.1,
-                key=f"{key_prefix}_legend_bg_opacity"
-            )
-        with col2:
-            legend_border = st.color_picker(
-                "Border",
-                value="#FFFFFF",
-                key=f"{key_prefix}_legend_border"
-            )
-            legend_border_width = st.slider(
-                "Border Width",
-                0, 5, 1,
-                key=f"{key_prefix}_legend_border_width"
-            )
-    
-    with st.expander("📏 Line Settings"):
-        col1, col2 = st.columns(2)
-        with col1:
-            line_width = st.slider(
-                "Line Width",
-                1, 8, 2,
-                key=f"{key_prefix}_line_width"
-            )
-        with col2:
-            marker_size = st.slider(
-                "Marker Size",
-                2, 16, 6,
-                key=f"{key_prefix}_marker_size"
-            )
-    
-    return {
-        'plot_bgcolor': plot_bg,
-        'paper_bgcolor': paper_bg,
-        'title_color': title_color,
-        'axis_color': axis_color,
-        'legend_text_color': legend_color,
-        'grid_color': grid_color,
-        'grid_opacity': grid_opacity,
-        'zeroline_color': zeroline_color,
-        'zeroline_opacity': zeroline_opacity,
-        'legend_bgcolor': legend_bg,
-        'legend_bg_opacity': legend_bg_opacity,
-        'legend_border_color': legend_border,
-        'legend_border_width': legend_border_width,
-        'line_width': line_width,
-        'marker_size': marker_size
-    }
+def palette_colors(palette: str, n: int) -> List[str]:
+    """n hex colours from a named palette; sequential palettes spread over their range."""
+    if n <= 0:
+        return []
+    positions = [i / max(n - 1, 1) for i in range(n)]
+    if palette == 'Viridis (sequential)':
+        return [_to_hex(c) for c in px.colors.sample_colorscale('Viridis', [0.9 * p for p in positions])]
+    if palette == 'Greyscale':
+        return [_to_hex(c) for c in px.colors.sample_colorscale([[0, 'rgb(0,0,0)'], [1, 'rgb(180,180,180)']], positions)]
+    colors = px.colors.qualitative.Plotly if palette == 'Plotly' else COLORBLIND_SAFE_PALETTE
+    return [colors[i % len(colors)] for i in range(n)]
 
 
-def apply_style_to_figure(fig, style_config, line_colors=None, font_config=None, legend_config=None):
-    """Apply style customizations to a Plotly figure.
-    
-    Args:
-        fig: Plotly figure object
-        style_config: Dictionary with style settings
-        line_colors: Optional dictionary mapping trace names to colors
-        font_config: Optional dictionary with font sizes
-        legend_config: Optional dictionary with legend settings
-    """
-    def hex_to_rgba(hex_color, opacity=1.0):
-        hex_color = hex_color.lstrip('#')
-        r, g, b = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
-        return f'rgba({r},{g},{b},{opacity})'
-    
-    grid_rgba = hex_to_rgba(style_config['grid_color'], style_config['grid_opacity'])
-    zeroline_rgba = hex_to_rgba(style_config['zeroline_color'], style_config['zeroline_opacity'])
-    legend_bg_rgba = hex_to_rgba(style_config['legend_bgcolor'], style_config['legend_bg_opacity'])
-    
-    # Default font sizes if not provided
-    if font_config is None:
-        font_config = {
-            'title_size': 16,
-            'axis_label_size': 12,
-            'tick_size': 10,
-            'legend_size': 10
-        }
-    
-    # Default legend config if not provided
-    if legend_config is None:
-        legend_config = {
-            'show': True,
-            'title': '',
-            'orientation': 'v',
-            'x': 0.01,
-            'y': 0.99,
-            'xanchor': 'left',
-            'yanchor': 'top'
-        }
-    
-    # Build legend dict
-    legend_dict = {
-        'bgcolor': legend_bg_rgba,
-        'bordercolor': style_config['legend_border_color'],
-        'borderwidth': style_config['legend_border_width'],
-        'font': dict(
-            color=style_config['legend_text_color'],
-            size=font_config['legend_size']
-        ),
-        'orientation': legend_config['orientation'],
-        'x': legend_config['x'],
-        'y': legend_config['y'],
-        'xanchor': legend_config['xanchor'],
-        'yanchor': legend_config['yanchor']
-    }
-    
-    if legend_config.get('title'):
-        legend_dict['title'] = dict(
-            text=legend_config['title'],
-            font=dict(size=font_config['legend_size'] + 2)
-        )
-    
-    fig.update_layout(
-        paper_bgcolor=style_config['paper_bgcolor'],
-        plot_bgcolor=style_config['plot_bgcolor'],
-        font=dict(
-            color=style_config['axis_color'],
-            size=font_config['tick_size']
-        ),
-        title=dict(
-            font=dict(
-                color=style_config['title_color'],
-                size=font_config['title_size']
+def get_line_colors_ui(trace_names: List[str], palette: str, key_prefix: str = "") -> Dict[str, str]:
+    """Colours from the chosen palette, with optional per-line overrides."""
+    colors = dict(zip(trace_names, palette_colors(palette, len(trace_names))))
+    if trace_names and st.checkbox("Set colours per line", key=f"{key_prefix}_custom_colors"):
+        for idx, name in enumerate(trace_names):
+            colors[name] = st.color_picker(
+                name[:40], value=colors[name], key=f"{key_prefix}_line_{idx}_{palette}"
             )
-        ),
-        legend=legend_dict,
-        showlegend=legend_config['show']
-    )
-    
-    # Style every x/y axis so multi-panel figures (subplots) are styled consistently
-    axis_style = dict(
-        gridcolor=grid_rgba,
-        zerolinecolor=zeroline_rgba,
-        color=style_config['axis_color'],
-        title_font=dict(size=font_config['axis_label_size']),
-        tickfont=dict(size=font_config['tick_size'])
-    )
-    fig.update_xaxes(**axis_style)
-    fig.update_yaxes(**axis_style)
-    # Subplot titles are annotations; keep them in the title colour
-    fig.update_annotations(font=dict(color=style_config['title_color']))
-    
-    # Apply line colors and settings
-    if line_colors:
-        for trace in fig.data:
-            trace_name = trace.name
-            if trace_name in line_colors:
-                trace.update(
-                    line=dict(
-                        color=line_colors[trace_name],
-                        width=style_config['line_width']
-                    ),
-                    marker=dict(
-                        size=style_config['marker_size'],
-                        color=line_colors[trace_name]
-                    )
-                )
-    else:
-        # Apply default line settings
-        fig.update_traces(
-            line=dict(width=style_config['line_width']),
-            marker=dict(size=style_config['marker_size'])
-        )
-    
-    return fig
+    return colors
 
-#WIP - PRESETS
+
 def get_research_presets():
     """Return dictionary of research paper quality presets.
-    
+
     Returns:
         Dictionary with preset configurations
     """
     return {
+        "Publication": {
+            'plot_bgcolor': '#FFFFFF',
+            'paper_bgcolor': '#FFFFFF',
+            'title_color': '#000000',
+            'axis_color': '#000000',
+            'legend_text_color': '#000000',
+            'grid_color': '#D9D9D9',
+            'grid_opacity': 0.6,
+            'zeroline_color': '#9E9E9E',
+            'zeroline_opacity': 0.6,
+            'legend_bgcolor': '#FFFFFF',
+            'legend_bg_opacity': 0.8,
+            'legend_border_color': '#BFBFBF',
+            'legend_border_width': 1,
+            'line_width': 2,
+            'marker_size': 6,
+            'description': 'White background, boxed axes, light grid'
+        },
         "Nature/Science": {
             'plot_bgcolor': '#FFFFFF',
             'paper_bgcolor': '#FFFFFF',
@@ -1670,6 +1514,24 @@ def get_research_presets():
             'marker_size': 5,
             'description': 'Standard publication style'
         },
+        "Grayscale Print": {
+            'plot_bgcolor': '#FFFFFF',
+            'paper_bgcolor': '#FFFFFF',
+            'title_color': '#000000',
+            'axis_color': '#000000',
+            'legend_text_color': '#000000',
+            'grid_color': '#CCCCCC',
+            'grid_opacity': 0.3,
+            'zeroline_color': '#000000',
+            'zeroline_opacity': 0.8,
+            'legend_bgcolor': '#F5F5F5',
+            'legend_bg_opacity': 1.0,
+            'legend_border_color': '#000000',
+            'legend_border_width': 1,
+            'line_width': 2,
+            'marker_size': 6,
+            'description': 'Optimized for B&W printing (use the Greyscale palette)'
+        },
         "Presentation": {
             'plot_bgcolor': '#000000',
             'paper_bgcolor': '#000000',
@@ -1688,557 +1550,269 @@ def get_research_presets():
             'marker_size': 8,
             'description': 'Dark theme, high visibility'
         },
-        "Grayscale Print": {
-            'plot_bgcolor': '#FFFFFF',
-            'paper_bgcolor': '#FFFFFF',
-            'title_color': '#000000',
-            'axis_color': '#000000',
-            'legend_text_color': '#000000',
-            'grid_color': '#CCCCCC',
-            'grid_opacity': 0.3,
-            'zeroline_color': '#000000',
-            'zeroline_opacity': 0.8,
-            'legend_bgcolor': '#F5F5F5',
-            'legend_bg_opacity': 1.0,
-            'legend_border_color': '#000000',
-            'legend_border_width': 1,
-            'line_width': 2,
-            'marker_size': 6,
-            'description': 'Optimized for B&W printing'
-        }
     }
 
 
-def get_colorblind_safe_palette():
-    """Return colorblind-safe color palette.
-    
-    Returns:
-        List of hex colors
-    """
-    return [
-        '#0173B2',  # Blue
-        '#DE8F05',  # Orange
-        '#029E73',  # Green
-        '#CC78BC',  # Purple
-        '#CA9161',  # Brown
-        '#949494',  # Gray
-        '#ECE133',  # Yellow
-        '#56B4E9'   # Sky Blue
-    ]
+def apply_style_to_figure(fig, style_config, line_colors=None, font_config=None, legend_config=None):
+    """Apply style customizations to a Plotly figure.
 
-
-def get_export_ui(fig, key_prefix=""):
-    """Create advanced export UI with dimension and format options.
-    
     Args:
-        fig: Plotly figure to export
-        key_prefix: Prefix for widget keys
-        
-    Returns:
-        None (handles export internally)
+        fig: Plotly figure object
+        style_config: Dictionary with style settings
+        line_colors: Optional dictionary mapping trace names to colors
+        font_config: Optional dictionary with font sizes
+        legend_config: Optional dictionary with legend settings
     """
-    st.markdown("---")
-    st.markdown("### 📥 Export Plot")
-    
-    with st.expander("Export Settings", expanded=True):
-        # Export format
-        export_format = st.selectbox(
-            "File Format",
-            options=['PNG', 'SVG', 'PDF', 'JPEG'],
-            help="PNG: Raster, best for most uses | SVG: Vector, scalable | PDF: Vector, publications | JPEG: Compressed",
-            key=f"{key_prefix}_export_format"
+    def hex_to_rgba(hex_color, opacity=1.0):
+        hex_color = hex_color.lstrip('#')
+        r, g, b = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+        return f'rgba({r},{g},{b},{opacity})'
+
+    grid_rgba = hex_to_rgba(style_config['grid_color'], style_config['grid_opacity'])
+    zeroline_rgba = hex_to_rgba(style_config['zeroline_color'], style_config['zeroline_opacity'])
+    legend_bg_rgba = hex_to_rgba(style_config['legend_bgcolor'], style_config['legend_bg_opacity'])
+
+    if font_config is None:
+        font_config = DEFAULT_FONT_CONFIG
+
+    if legend_config is None:
+        legend_config = {'show': True, 'title': '', 'orientation': 'v', **LEGEND_POSITIONS['top-left']}
+
+    legend_dict = {
+        'bgcolor': legend_bg_rgba,
+        'bordercolor': style_config['legend_border_color'],
+        'borderwidth': style_config['legend_border_width'],
+        'font': dict(
+            color=style_config['legend_text_color'],
+            size=font_config['legend_size']
+        ),
+        'orientation': legend_config['orientation'],
+        'x': legend_config['x'],
+        'y': legend_config['y'],
+        'xanchor': legend_config['xanchor'],
+        'yanchor': legend_config['yanchor']
+    }
+
+    if legend_config.get('title'):
+        legend_dict['title'] = dict(
+            text=legend_config['title'],
+            font=dict(size=font_config['legend_size'] + 2)
         )
-        
-        # Preset dimensions
-        col1, col2 = st.columns(2)
-        with col1:
-            preset = st.selectbox(
-                "Dimension Preset",
-                options=[
-                    'Custom',
-                    'Publication Single Column (3.5" × 2.5")',
-                    'Publication Double Column (7" × 5")',
-                    'Publication Full Page (8.5" × 6.5")',
-                    'Presentation 16:9 (1920 × 1080)',
-                    'Presentation 4:3 (1600 × 1200)',
-                    'Poster (3600 × 2700)',
-                    'Screen HD (1280 × 720)',
-                    'Screen Full HD (1920 × 1440)',
-                    'Ultra HD (3840 × 2160)'
-                ],
-                key=f"{key_prefix}_preset"
+
+    fig.update_layout(
+        paper_bgcolor=style_config['paper_bgcolor'],
+        plot_bgcolor=style_config['plot_bgcolor'],
+        font=dict(
+            family=PLOT_FONT_FAMILY,
+            color=style_config['axis_color'],
+            size=font_config['tick_size']
+        ),
+        title=dict(
+            font=dict(
+                color=style_config['title_color'],
+                size=font_config['title_size']
             )
-        
-        # Dimension mapping
-        preset_dims = {
-            'Custom': (1600, 1200),
-            'Publication Single Column (3.5" × 2.5")': (1050, 750),
-            'Publication Double Column (7" × 5")': (2100, 1500),
-            'Publication Full Page (8.5" × 6.5")': (2550, 1950),
-            'Presentation 16:9 (1920 × 1080)': (1920, 1080),
-            'Presentation 4:3 (1600 × 1200)': (1600, 1200),
-            'Poster (3600 × 2700)': (3600, 2700),
-            'Screen HD (1280 × 720)': (1280, 720),
-            'Screen Full HD (1920 × 1440)': (1920, 1440),
-            'Ultra HD (3840 × 2160)': (3840, 2160)
-        }
-        
-        default_width, default_height = preset_dims.get(preset, (1600, 1200))
-        
-        with col2:
-            dpi = st.selectbox(
-                "DPI / Quality",
-                options=[72, 150, 300, 600],
-                index=2,
-                help="72: Screen | 150: Draft print | 300: Publication | 600: High quality",
-                key=f"{key_prefix}_dpi"
-            )
-        
-        # Custom dimensions
-        if preset == 'Custom':
-            col1, col2 = st.columns(2)
-            with col1:
-                width = st.number_input(
-                    "Width (pixels)",
-                    min_value=400,
-                    max_value=10000,
-                    value=default_width,
-                    step=100,
-                    key=f"{key_prefix}_width"
+        ),
+        legend=legend_dict,
+        showlegend=legend_config['show']
+    )
+
+    # Style every x/y axis so multi-panel figures (subplots) are styled consistently:
+    # boxed axes with outside ticks, as in printed figures
+    axis_style = dict(
+        gridcolor=grid_rgba,
+        zerolinecolor=zeroline_rgba,
+        color=style_config['axis_color'],
+        showline=True,
+        linecolor=style_config['axis_color'],
+        linewidth=1,
+        mirror=True,
+        ticks='outside',
+        title_font=dict(size=font_config['axis_label_size']),
+        tickfont=dict(size=font_config['tick_size'])
+    )
+    fig.update_xaxes(**axis_style)
+    fig.update_yaxes(**axis_style)
+    # Log axes: labelled decades as powers of ten, unlabelled minor ticks in between
+    log_axis_style = dict(dtick=1, exponentformat='power', minor=dict(ticks='outside', showgrid=False))
+    fig.for_each_xaxis(lambda axis: axis.update(**log_axis_style) if axis.type == 'log' else None)
+    fig.for_each_yaxis(lambda axis: axis.update(**log_axis_style) if axis.type == 'log' else None)
+    # Subplot titles are annotations; keep them in the title colour
+    fig.update_annotations(font=dict(color=style_config['title_color']))
+
+    # Apply line colors and settings
+    if line_colors:
+        for trace in fig.data:
+            trace_name = trace.name
+            if trace_name in line_colors:
+                trace.update(
+                    line=dict(
+                        color=line_colors[trace_name],
+                        width=style_config['line_width']
+                    ),
+                    marker=dict(
+                        size=style_config['marker_size'],
+                        color=line_colors[trace_name]
+                    )
                 )
-            with col2:
-                height = st.number_input(
-                    "Height (pixels)",
-                    min_value=300,
-                    max_value=10000,
-                    value=default_height,
-                    step=100,
-                    key=f"{key_prefix}_height"
-                )
-        else:
-            width = default_width
-            height = default_height
-            st.info(f"Dimensions: {width} × {height} pixels")
-        
-        # Scale factor
-        scale = st.slider(
-            "Scale Factor",
-            min_value=1,
-            max_value=4,
-            value=2,
-            help="Higher scale = better quality, larger file. 2× is standard.",
-            key=f"{key_prefix}_scale"
+    else:
+        # Apply default line settings
+        fig.update_traces(
+            line=dict(width=style_config['line_width']),
+            marker=dict(size=style_config['marker_size'])
         )
-        
-        # File name
-        filename = st.text_input(
-            "Filename",
-            value=f"sip_plot.{export_format.lower()}",
-            key=f"{key_prefix}_filename"
-        )
-        
-        # Calculate file info
-        estimated_size = (width * height * scale * scale * 3) / (1024 * 1024)  # Rough estimate
-        st.caption(f"Estimated size: ~{estimated_size:.1f} MB | Final: {width * scale} × {height * scale} pixels")
-        
-        # Export button
-        if st.button("📥 Export Plot", type="primary", key=f"{key_prefix}_export_btn"):
-            try:
-                # Update figure size
-                fig.update_layout(
-                    width=width,
-                    height=height
-                )
-                
-                # Export based on format
-                if export_format == 'PNG':
-                    img_bytes = fig.to_image(
-                        format='png',
-                        width=width,
-                        height=height,
-                        scale=scale
-                    )
-                    mime_type = 'image/png'
-                elif export_format == 'JPEG':
-                    img_bytes = fig.to_image(
-                        format='jpeg',
-                        width=width,
-                        height=height,
-                        scale=scale
-                    )
-                    mime_type = 'image/jpeg'
-                elif export_format == 'SVG':
-                    img_bytes = fig.to_image(
-                        format='svg',
-                        width=width,
-                        height=height
-                    )
-                    mime_type = 'image/svg+xml'
-                elif export_format == 'PDF':
-                    img_bytes = fig.to_image(
-                        format='pdf',
-                        width=width,
-                        height=height
-                    )
-                    mime_type = 'application/pdf'
-                
-                # Provide download button
-                st.download_button(
-                    label=f"⬇️ Download {export_format}",
-                    data=img_bytes,
-                    file_name=filename,
-                    mime=mime_type,
-                    key=f"{key_prefix}_download"
-                )
-                
-                st.success(f"✅ Plot exported successfully! Click 'Download {export_format}' above.")
-                
-            except Exception as e:
-                st.error(f"Export failed: {str(e)}")
-                st.info("💡 Tip: Try installing kaleido: `pip install kaleido`")
+
+    return fig
 
 
-def get_research_customization_ui(key_prefix=""):
-    """Create research-paper level customization UI with presets, fonts, and legend control.
-    
-    Args:
-        key_prefix: Prefix for widget keys
-        
+def get_style_overrides_ui(key_prefix: str, defaults: Dict, preset_name: str) -> Dict:
+    """Colour and line overrides, initialised from the selected preset."""
+    key = f"{key_prefix}_{preset_name}"
+    col1, col2 = st.columns(2)
+    with col1:
+        plot_bg = st.color_picker("Plot background", value=defaults['plot_bgcolor'], key=f"{key}_plot_bg")
+        text_color = st.color_picker("Text and axes", value=defaults['axis_color'], key=f"{key}_text")
+        grid_color = st.color_picker("Grid", value=defaults['grid_color'], key=f"{key}_grid")
+        legend_bg = st.color_picker("Legend background", value=defaults['legend_bgcolor'], key=f"{key}_legend_bg")
+    with col2:
+        paper_bg = st.color_picker("Paper background", value=defaults['paper_bgcolor'], key=f"{key}_paper_bg")
+        zeroline_color = st.color_picker("Zero line", value=defaults['zeroline_color'], key=f"{key}_zeroline")
+        legend_border = st.color_picker("Legend border", value=defaults['legend_border_color'],
+                                        key=f"{key}_legend_border")
+    grid_opacity = st.slider("Grid opacity", 0.0, 1.0, float(defaults['grid_opacity']), 0.1, key=f"{key}_grid_opacity")
+    line_width = st.slider("Line width", 1, 8, int(defaults['line_width']), key=f"{key}_line_width")
+    marker_size = st.slider("Marker size", 2, 16, int(defaults['marker_size']), key=f"{key}_marker_size")
+    return {
+        **defaults,
+        'plot_bgcolor': plot_bg,
+        'paper_bgcolor': paper_bg,
+        'title_color': text_color,
+        'axis_color': text_color,
+        'legend_text_color': text_color,
+        'grid_color': grid_color,
+        'grid_opacity': grid_opacity,
+        'zeroline_color': zeroline_color,
+        'legend_bgcolor': legend_bg,
+        'legend_border_color': legend_border,
+        'line_width': line_width,
+        'marker_size': marker_size,
+    }
+
+
+def get_style_ui(key_prefix: str = "") -> Tuple[Dict, str, Dict, Dict]:
+    """Figure style controls: preset, palette, font sizes and legend.
+
     Returns:
-        Tuple of (style_config, use_colorblind, font_config, legend_config)
+        Tuple of (style_config, palette name, font_config, legend_config)
     """
-    st.markdown("---")
-    st.markdown("**🎓 Research Paper Customization:**")
-    
-    # Preset selection
     presets = get_research_presets()
-    preset_names = list(presets.keys())
-    
-    selected_preset = st.selectbox(
-        "📋 Style Preset",
-        options=['Custom'] + preset_names,
-        help="Choose a journal-specific preset or custom",
+    preset_name = st.selectbox(
+        "Style preset", options=list(presets), index=list(presets).index(DEFAULT_STYLE_PRESET),
         key=f"{key_prefix}_preset_select"
     )
-    
-    # Initialize style_config
-    if selected_preset != 'Custom':
-        st.caption(f"ℹ️ {presets[selected_preset]['description']}")
-        
-        # Load preset values
-        preset_config = presets[selected_preset].copy()
-        preset_config.pop('description', None)
-        
-        # Show preset values but allow override
-        override = st.checkbox("Override preset values", value=False, key=f"{key_prefix}_override")
-        
-        if override:
-            # Get custom values but initialize with preset defaults
-            style_config = get_plot_style_customization_with_defaults(key_prefix, preset_config)
-        else:
-            style_config = preset_config
-    else:
-        # Full custom mode
-        default_config = {
-            'plot_bgcolor': '#000000',
-            'paper_bgcolor': '#000000',
-            'title_color': '#FFFFFF',
-            'axis_color': '#FFFFFF',
-            'legend_text_color': '#FFFFFF',
-            'grid_color': '#808080',
-            'grid_opacity': 0.3,
-            'zeroline_color': '#808080',
-            'zeroline_opacity': 0.5,
-            'legend_bgcolor': '#000000',
-            'legend_bg_opacity': 0.8,
-            'legend_border_color': '#FFFFFF',
-            'legend_border_width': 1,
-            'line_width': 2,
-            'marker_size': 6
-        }
-        style_config = get_plot_style_customization_with_defaults(key_prefix, default_config)
-    
-    # Font customization
-    st.markdown("---")
-    with st.expander("🔤 Font Sizes", expanded=False):
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            title_size = st.slider(
-                "Title",
-                min_value=10,
-                max_value=32,
-                value=16,
-                key=f"{key_prefix}_title_size"
-            )
-        with col2:
-            axis_label_size = st.slider(
-                "Axis Labels",
-                min_value=8,
-                max_value=24,
-                value=12,
-                key=f"{key_prefix}_axis_label_size"
-            )
-        with col3:
-            tick_size = st.slider(
-                "Tick Labels",
-                min_value=6,
-                max_value=20,
-                value=10,
-                key=f"{key_prefix}_tick_size"
-            )
-        
-        legend_size = st.slider(
-            "Legend Text",
-            min_value=6,
-            max_value=20,
-            value=10,
-            key=f"{key_prefix}_legend_size"
-        )
-    
+    style_config = presets[preset_name].copy()
+    st.caption(style_config.pop('description'))
+    palette = st.selectbox("Line palette", options=PALETTES, key=f"{key_prefix}_palette",
+                           help="Colour-blind safe: Okabe & Ito (2008). Viridis suits ordered loops.")
+    if st.checkbox("Adjust colours and lines", key=f"{key_prefix}_override"):
+        style_config = get_style_overrides_ui(key_prefix, style_config, preset_name)
+
+    st.markdown("**Font sizes**")
+    col1, col2 = st.columns(2)
+    with col1:
+        title_size = st.number_input("Title", 8, 36, DEFAULT_FONT_CONFIG['title_size'], key=f"{key_prefix}_title_size")
+        tick_size = st.number_input("Tick labels", 6, 30, DEFAULT_FONT_CONFIG['tick_size'], key=f"{key_prefix}_tick_size")
+    with col2:
+        axis_label_size = st.number_input("Axis labels", 6, 30, DEFAULT_FONT_CONFIG['axis_label_size'],
+                                          key=f"{key_prefix}_axis_label_size")
+        legend_size = st.number_input("Legend", 6, 30, DEFAULT_FONT_CONFIG['legend_size'],
+                                      key=f"{key_prefix}_legend_size")
     font_config = {
         'title_size': title_size,
         'axis_label_size': axis_label_size,
         'tick_size': tick_size,
         'legend_size': legend_size
     }
-    
-    # Legend editor
-    st.markdown("---")
-    with st.expander("📦 Legend Editor", expanded=False):
-        col1, col2 = st.columns(2)
-        with col1:
-            legend_position = st.selectbox(
-                "Position",
-                options=[
-                    "top-left", "top-center", "top-right",
-                    "middle-left", "middle-right",
-                    "bottom-left", "bottom-center", "bottom-right",
-                    "outside-right"
-                ],
-                index=0,
-                key=f"{key_prefix}_legend_pos"
-            )
-        with col2:
-            legend_orientation = st.selectbox(
-                "Orientation",
-                options=["Vertical", "Horizontal"],
-                index=0,
-                key=f"{key_prefix}_legend_orient"
-            )
-        
-        # Map to Plotly's expected values
-        orientation_map = {
-            "Vertical": "v",
-            "Horizontal": "h"
-        }
-        plotly_orientation = orientation_map[legend_orientation]
-        
-        show_legend = st.checkbox(
-            "Show Legend",
-            value=True,
-            key=f"{key_prefix}_show_legend"
-        )
-        
-        if show_legend:
-            legend_title = st.text_input(
-                "Legend Title (optional)",
-                value="",
-                key=f"{key_prefix}_legend_title"
-            )
-        else:
-            legend_title = ""
-    
-    # Map legend position to coordinates
-    legend_pos_map = {
-        "top-left": {"x": 0.01, "y": 0.99, "xanchor": "left", "yanchor": "top"},
-        "top-center": {"x": 0.5, "y": 0.99, "xanchor": "center", "yanchor": "top"},
-        "top-right": {"x": 0.99, "y": 0.99, "xanchor": "right", "yanchor": "top"},
-        "middle-left": {"x": 0.01, "y": 0.5, "xanchor": "left", "yanchor": "middle"},
-        "middle-right": {"x": 0.99, "y": 0.5, "xanchor": "right", "yanchor": "middle"},
-        "bottom-left": {"x": 0.01, "y": 0.01, "xanchor": "left", "yanchor": "bottom"},
-        "bottom-center": {"x": 0.5, "y": 0.01, "xanchor": "center", "yanchor": "bottom"},
-        "bottom-right": {"x": 0.99, "y": 0.01, "xanchor": "right", "yanchor": "bottom"},
-        "outside-right": {"x": 1.02, "y": 0.5, "xanchor": "left", "yanchor": "middle"}
-    }
-    
+
+    st.markdown("**Legend**")
+    show_legend = st.checkbox("Show legend", value=True, key=f"{key_prefix}_show_legend")
+    col1, col2 = st.columns(2)
+    with col1:
+        legend_position = st.selectbox("Position", options=list(LEGEND_POSITIONS),
+                                       key=f"{key_prefix}_legend_pos")
+    with col2:
+        legend_orientation = st.selectbox("Orientation", options=["Vertical", "Horizontal"],
+                                          key=f"{key_prefix}_legend_orient")
+    legend_title = st.text_input("Legend title", value="", key=f"{key_prefix}_legend_title")
     legend_config = {
         'show': show_legend,
         'title': legend_title,
-        'orientation': plotly_orientation,
-        **legend_pos_map[legend_position]
+        'orientation': 'v' if legend_orientation == "Vertical" else 'h',
+        **LEGEND_POSITIONS[legend_position]
     }
-    
-    # Colorblind-safe palette option
-    st.markdown("---")
-    use_colorblind = st.checkbox(
-        "🌈 Use Colorblind-Safe Palette",
-        help="Apply scientifically-validated colorblind-safe colors",
-        key=f"{key_prefix}_colorblind"
-    )
-    
-    return style_config, use_colorblind, font_config, legend_config
+    return style_config, palette, font_config, legend_config
 
 
-def get_plot_style_customization_with_defaults(key_prefix="", defaults=None):
-    """Create UI for plot style customization with default values.
-    
+def get_export_ui(fig, key_prefix=""):
+    """Figure export controls (format, size, resolution) with a download button.
+
     Args:
+        fig: Plotly figure to export
         key_prefix: Prefix for widget keys
-        defaults: Dictionary with default values
-        
-    Returns:
-        Dictionary with style settings
     """
-    if defaults is None:
-        defaults = {
-            'plot_bgcolor': '#000000',
-            'paper_bgcolor': '#000000',
-            'title_color': '#FFFFFF',
-            'axis_color': '#FFFFFF',
-            'legend_text_color': '#FFFFFF',
-            'grid_color': '#808080',
-            'grid_opacity': 0.3,
-            'zeroline_color': '#808080',
-            'zeroline_opacity': 0.5,
-            'legend_bgcolor': '#000000',
-            'legend_bg_opacity': 0.8,
-            'legend_border_color': '#FFFFFF',
-            'legend_border_width': 1,
-            'line_width': 2,
-            'marker_size': 6
-        }
-    
-    st.markdown("**🎨 Plot Style:**")
-    
-    with st.expander("📊 Background Colors"):
-        col1, col2 = st.columns(2)
-        with col1:
-            plot_bg = st.color_picker(
-                "Plot Background",
-                value=defaults.get('plot_bgcolor', '#000000'),
-                help="Background inside plot area",
-                key=f"{key_prefix}_plot_bg"
-            )
-        with col2:
-            paper_bg = st.color_picker(
-                "Paper Background",
-                value=defaults.get('paper_bgcolor', '#000000'),
-                help="Background outside plot area",
-                key=f"{key_prefix}_paper_bg"
-            )
-    
-    with st.expander("✏️ Text Colors"):
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            title_color = st.color_picker(
-                "Title",
-                value=defaults.get('title_color', '#FFFFFF'),
-                key=f"{key_prefix}_title_color"
-            )
-        with col2:
-            axis_color = st.color_picker(
-                "Axis Labels",
-                value=defaults.get('axis_color', '#FFFFFF'),
-                key=f"{key_prefix}_axis_color"
-            )
-        with col3:
-            legend_color = st.color_picker(
-                "Legend",
-                value=defaults.get('legend_text_color', '#FFFFFF'),
-                key=f"{key_prefix}_legend_color"
-            )
-    
-    with st.expander("📐 Grid & Lines"):
-        col1, col2 = st.columns(2)
-        with col1:
-            grid_color = st.color_picker(
-                "Grid Color",
-                value=defaults.get('grid_color', '#808080'),
-                key=f"{key_prefix}_grid"
-            )
-            grid_opacity = st.slider(
-                "Grid Opacity",
-                0.0, 1.0, 
-                defaults.get('grid_opacity', 0.3), 
-                0.1,
-                key=f"{key_prefix}_grid_opacity"
-            )
-        with col2:
-            zeroline_color = st.color_picker(
-                "Zero Line",
-                value=defaults.get('zeroline_color', '#808080'),
-                key=f"{key_prefix}_zeroline"
-            )
-            zeroline_opacity = st.slider(
-                "Zero Line Opacity",
-                0.0, 1.0, 
-                defaults.get('zeroline_opacity', 0.5), 
-                0.1,
-                key=f"{key_prefix}_zeroline_opacity"
-            )
-    
-    with st.expander("📦 Legend Style"):
-        col1, col2 = st.columns(2)
-        with col1:
-            legend_bg = st.color_picker(
-                "Background",
-                value=defaults.get('legend_bgcolor', '#000000'),
-                key=f"{key_prefix}_legend_bg"
-            )
-            legend_bg_opacity = st.slider(
-                "BG Opacity",
-                0.0, 1.0, 
-                defaults.get('legend_bg_opacity', 0.8), 
-                0.1,
-                key=f"{key_prefix}_legend_bg_opacity"
-            )
-        with col2:
-            legend_border = st.color_picker(
-                "Border",
-                value=defaults.get('legend_border_color', '#FFFFFF'),
-                key=f"{key_prefix}_legend_border"
-            )
-            legend_border_width = st.slider(
-                "Border Width",
-                0, 5, 
-                defaults.get('legend_border_width', 1),
-                key=f"{key_prefix}_legend_border_width"
-            )
-    
-    with st.expander("📏 Line Settings"):
-        col1, col2 = st.columns(2)
-        with col1:
-            line_width = st.slider(
-                "Line Width",
-                1, 8, 
-                defaults.get('line_width', 2),
-                key=f"{key_prefix}_line_width"
-            )
-        with col2:
-            marker_size = st.slider(
-                "Marker Size",
-                2, 16, 
-                defaults.get('marker_size', 6),
-                key=f"{key_prefix}_marker_size"
-            )
-    
-    return {
-        'plot_bgcolor': plot_bg,
-        'paper_bgcolor': paper_bg,
-        'title_color': title_color,
-        'axis_color': axis_color,
-        'legend_text_color': legend_color,
-        'grid_color': grid_color,
-        'grid_opacity': grid_opacity,
-        'zeroline_color': zeroline_color,
-        'zeroline_opacity': zeroline_opacity,
-        'legend_bgcolor': legend_bg,
-        'legend_bg_opacity': legend_bg_opacity,
-        'legend_border_color': legend_border,
-        'legend_border_width': legend_border_width,
-        'line_width': line_width,
-        'marker_size': marker_size
+    export_format = st.selectbox(
+        "File format",
+        options=['PNG', 'SVG', 'PDF', 'JPEG'],
+        help="PNG: raster | SVG / PDF: vector, for publications | JPEG: compressed",
+        key=f"{key_prefix}_export_format"
+    )
+    preset_dims = {
+        'Single column (3.5" × 2.5" @ 300 dpi)': (1050, 750),
+        'Double column (7" × 5" @ 300 dpi)': (2100, 1500),
+        'Full page (8.5" × 6.5" @ 300 dpi)': (2550, 1950),
+        'Presentation 16:9 (1920 × 1080)': (1920, 1080),
+        'Presentation 4:3 (1600 × 1200)': (1600, 1200),
+        'Poster (3600 × 2700)': (3600, 2700),
+        'Custom': (1600, 1200),
     }
+    preset = st.selectbox("Size", options=list(preset_dims), key=f"{key_prefix}_preset")
+    width, height = preset_dims[preset]
+    if preset == 'Custom':
+        col1, col2 = st.columns(2)
+        with col1:
+            width = st.number_input("Width (px)", min_value=400, max_value=10000, value=width,
+                                    step=100, key=f"{key_prefix}_width")
+        with col2:
+            height = st.number_input("Height (px)", min_value=300, max_value=10000, value=height,
+                                     step=100, key=f"{key_prefix}_height")
+    scale = st.slider("Scale factor", min_value=1, max_value=4, value=2,
+                      help="Raster formats only: multiplies the pixel size", key=f"{key_prefix}_scale")
+    filename = st.text_input("Filename", value=f"sip_plot.{export_format.lower()}", key=f"{key_prefix}_filename")
+    st.caption(f"{width} × {height} px" + (f", rendered at {width * scale} × {height * scale} px"
+                                            if export_format in ('PNG', 'JPEG') else ""))
+
+    if st.button("Prepare file", type="primary", key=f"{key_prefix}_export_btn"):
+        try:
+            export_fig = go.Figure(fig)
+            export_fig.update_layout(width=width, height=height)
+            fmt = export_format.lower()
+            kwargs = dict(format=fmt, width=width, height=height)
+            if fmt in ('png', 'jpeg'):
+                kwargs['scale'] = scale
+            img_bytes = export_fig.to_image(**kwargs)
+            mime_type = {'png': 'image/png', 'jpeg': 'image/jpeg',
+                         'svg': 'image/svg+xml', 'pdf': 'application/pdf'}[fmt]
+            st.download_button(
+                label=f"Download {export_format}",
+                data=img_bytes,
+                file_name=filename,
+                mime=mime_type,
+                key=f"{key_prefix}_download"
+            )
+        except Exception as e:
+            st.error(f"Export failed: {str(e)}")
+            st.info("Figure export needs the kaleido package (and Chrome/Chromium).")
+
 
 # ============================================================================
 # STATISTICAL ANALYSIS FUNCTIONS
@@ -2289,456 +1863,300 @@ def descriptive_stats(self, columns: List[str]) -> pd.DataFrame:
         return pd.DataFrame(stats_dict).T
     
 
+def get_loop_selection_ui(datasets: Dict[str, pd.DataFrame], key_prefix: str) -> Optional[Dict[str, List[str]]]:
+    """Loop filter per file. Returns {file: selected loops}, or None when no file has loops."""
+    with_loops = {name: df for name, df in datasets.items() if 'Loop' in df.columns}
+    if not with_loops:
+        return None
+    selected_loops = {}
+    for name, df in with_loops.items():
+        loops = sorted(df['Loop'].unique())
+        label = "Loops" if len(datasets) == 1 else f"Loops · {name}"
+        selected_loops[name] = st.multiselect(
+            label, options=loops, default=loops, key=f"{key_prefix}_loops_{name}",
+            help="Measurement loops to plot"
+        )
+    return selected_loops
+
+
+def render_spectra_tab(datasets: Dict[str, pd.DataFrame], key_prefix: str):
+    """Plot controls (left) and figure (right) for one or more processed files."""
+    col_ctrl, col_plot = st.columns([1, 3], gap="large")
+    with col_ctrl:
+        if len(datasets) > 1:
+            names = st.multiselect("Files", options=list(datasets), default=list(datasets),
+                                   key=f"{key_prefix}_files")
+            datasets = {name: datasets[name] for name in names}
+        if not datasets:
+            st.warning("Select at least one file.")
+            return
+        first = next(iter(datasets.values()))
+        common_cols = [c for c in first.columns if all(c in df.columns for df in datasets.values())]
+
+        plot_mode = st.radio("Plot", ["SIP two-panel", "Custom X / Y"], horizontal=True,
+                             key=f"{key_prefix}_plot_mode")
+        two_panel = get_two_panel_settings_ui(common_cols, key_prefix) if plot_mode == "SIP two-panel" else None
+        plot_type = 'overlay'
+        if two_panel is None:
+            numeric_cols = [c for c in common_cols if pd.api.types.is_numeric_dtype(first[c])]
+            if not numeric_cols:
+                st.error("No common numeric columns to plot.")
+                return
+            freq_col = find_frequency_column(numeric_cols)
+            default_y = next((c for c in numeric_cols if c.endswith(PHASE_QUANTITY)), numeric_cols[-1])
+            x_axis = st.selectbox("X axis", options=numeric_cols, format_func=display_name,
+                                  index=numeric_cols.index(freq_col) if freq_col else 0,
+                                  key=f"{key_prefix}_x")
+            y_axis = st.selectbox("Y axis", options=numeric_cols, format_func=display_name,
+                                  index=numeric_cols.index(default_y), key=f"{key_prefix}_y")
+            if len(datasets) > 1:
+                plot_type = st.radio("Layout", ["overlay", "subplots"], horizontal=True,
+                                     format_func=lambda x: "Overlay" if x == "overlay" else "One panel per file",
+                                     key=f"{key_prefix}_plot_type")
+        log_cols = st.columns(2)
+        log_x = log_cols[0].checkbox("Log x", value=True, key=f"{key_prefix}_log_x")
+        log_y = log_cols[1].checkbox("Log lower y" if two_panel else "Log y", value=False,
+                                     key=f"{key_prefix}_log_y")
+        selected_loops = get_loop_selection_ui(datasets, key_prefix)
+
+        with st.expander("Labels"):
+            if two_panel:
+                channel = two_panel['channel']
+                labels = get_labels_ui({
+                    'Title': f"{channel} SIP spectrum",
+                    'X axis': axis_label(two_panel['freq_col']),
+                    'Upper y axis': axis_label(channel_column(channel, PHASE_QUANTITY)),
+                    'Lower y axis': axis_label(channel_column(channel, two_panel['bottom_quantity'])),
+                }, key_prefix)
+            else:
+                labels = get_labels_ui({
+                    'Title': display_name(y_axis),
+                    'X axis': axis_label(x_axis),
+                    'Y axis': axis_label(y_axis),
+                }, key_prefix)
+        with st.expander("Style"):
+            style_config, palette, font_config, legend_config = get_style_ui(key_prefix)
+
+        # Fluid calibration check applies when phase is plotted against frequency
+        if two_panel:
+            phase_channel, freq_col = two_panel['channel'], two_panel['freq_col']
+        elif y_axis.endswith(PHASE_QUANTITY) and x_axis == find_frequency_column(common_cols):
+            phase_channel, freq_col = split_channel(y_axis)[0], x_axis
+        else:
+            phase_channel, freq_col = None, find_frequency_column(common_cols)
+        first_name = next(iter(datasets))
+        with st.expander("Fluid calibration check"):
+            fluid = get_fluid_calibration_ui(
+                phase_channel,
+                measured_low_frequency_conductivity(datasets[first_name], phase_channel, freq_col)
+                if phase_channel else np.nan,
+                f"{key_prefix}_{first_name}_{phase_channel}"
+            )
+
+    if two_panel:
+        fig = create_sip_two_panel_plot(
+            datasets, two_panel['channel'], two_panel['bottom_quantity'], two_panel['freq_col'],
+            log_x=log_x, log_y_bottom=log_y, selected_loops=selected_loops,
+            title=labels['Title'], x_label=labels['X axis'],
+            top_label=labels['Upper y axis'], bottom_label=labels['Lower y axis']
+        )
+    else:
+        fig = create_comparison_plot(
+            datasets, x_axis, y_axis, log_x=log_x, log_y=log_y, plot_type=plot_type,
+            selected_loops=selected_loops, custom_title=labels['Title'],
+            custom_x_label=labels['X axis'], custom_y_label=labels['Y axis']
+        )
+    if not fig.data:
+        col_plot.warning("No data selected.")
+        return
+
+    # Two-panel traces share names, so colour each name once
+    trace_names = list(dict.fromkeys(trace.name for trace in fig.data))
+    with col_ctrl:
+        with st.expander("Line colours"):
+            line_colors = get_line_colors_ui(trace_names, palette, key_prefix)
+
+    fig = apply_style_to_figure(fig, style_config, line_colors, font_config, legend_config)
+    if fluid:
+        all_freqs = pd.concat([df[freq_col] for df in datasets.values()])
+        if two_panel:
+            fluid_rows = [1]
+        elif plot_type == 'subplots':
+            fluid_rows = list(range(1, len(datasets) + 1))
+        else:
+            fluid_rows = None
+        add_fluid_phase_overlay(fig, all_freqs.min(), all_freqs.max(),
+                                fluid['sigma'], fluid['eps_r'], fluid['tolerance'], rows=fluid_rows)
+
+    with col_plot:
+        st.plotly_chart(fig, use_container_width=True, config=get_plot_config(), theme=None)
+        if fluid:
+            show_fluid_deviation_table(datasets, freq_col, fluid, selected_loops)
+    with col_ctrl:
+        with st.expander("Export figure"):
+            get_export_ui(fig, key_prefix)
+
+
+def render_about():
+    """Landing text shown before any file is uploaded."""
+    st.info("Upload one or more SIP files in the sidebar to begin.")
+    st.markdown("""
+**Input formats**
+- O&E PSIP files (multi-channel, multiple loops; magnitude as ratio or dB, auto-detected)
+- Simple tables with frequency, magnitude and phase columns
+
+**Processing**
+- Resistance, resistivity |ρ|, conductivity σ, σ′ and σ″, and phase −φ (mrad) per channel
+- Sample geometry from length and area or diameter, set per file when comparing samples
+
+**Analysis**
+- SIP two-panel spectra (phase over magnitude/conductivity) or any X/Y combination
+- Fluid calibration check against the theoretical phase of water
+- Debye decomposition with integral parameters (Weigand & Kemna, 2016)
+
+**Output**
+- Processed data and Debye parameters as CSV; figures as PNG, SVG or PDF with journal style presets
+""")
+
+
 # ============================================================================
 # MAIN APPLICATION
 # ============================================================================
 
 def main():
-    st.title("SIP Data Analysis Tool")
- 
-    if 'datasets' not in st.session_state:
-        st.session_state.datasets = {}
- 
+    st.title("SDAT · SIP Data Analysis Tool")
+    st.caption("Spectral induced polarization data from O&E PSIP instruments")
+
     with st.sidebar:
-        st.header("1. Upload Data Files")
-        mode = st.radio("Analysis Mode", ["Single File", "Compare Multiple Files"])
+        st.header("Data")
+        mode = st.radio("Analysis mode", ["Single file", "Compare files"], horizontal=True)
         uploaded_files = st.file_uploader(
-            "Upload SIP files", type=["csv", "txt"], accept_multiple_files=True
+            "SIP files", type=["csv", "txt"], accept_multiple_files=True
         )
-        st.header("2. Sample Properties")
-        sample_length = st.number_input("Sample Length (m)", value=DEFAULT_SAMPLE_LENGTH, format="%.4f")
-        size_input = st.radio("Cross-section input", ["Area", "Diameter"], horizontal=True)
+        active_file = None
+        if mode == "Single file" and uploaded_files and len(uploaded_files) > 1:
+            active_file = st.selectbox("Active file", options=[f.name for f in uploaded_files])
+
+        st.header("Sample & instrument")
+        sample_length = st.number_input("Sample length L (m)", value=DEFAULT_SAMPLE_LENGTH, format="%.4f")
+        size_input = st.radio("Cross-section", ["Area", "Diameter"], horizontal=True)
         if size_input == "Diameter":
             sample_diameter = st.number_input(
-                "Sample Diameter (m)", value=DEFAULT_SAMPLE_DIAMETER, format="%.4f", min_value=0.0
+                "Diameter d (m)", value=DEFAULT_SAMPLE_DIAMETER, format="%.4f", min_value=0.0
             )
             sample_area = area_from_diameter(sample_diameter)
-            st.caption(f"Area = π(d/2)² = {sample_area:.6f} m²")
+            st.caption(f"A = π(d/2)² = {sample_area:.6f} m²")
         else:
             sample_diameter = None
-            sample_area = st.number_input("Sample Area (m²)", value=DEFAULT_SAMPLE_AREA, format="%.6f")
+            sample_area = st.number_input("Area A (m²)", value=DEFAULT_SAMPLE_AREA, format="%.6f")
         global_geometry = {'length': sample_length, 'area': sample_area, 'diameter': sample_diameter}
-        manual_ref = st.number_input("Reference Resistor (Ohms)", value=0.0)
+        manual_ref = st.number_input("Reference resistor R_ref (Ω)", value=0.0,
+                                     help="0 uses the value in each file header")
         magnitude_unit_choice = st.selectbox(
             "Magnitude unit",
             options=["Auto-detect", "ratio", "dB"],
             help="Auto-detect reads the column unit (Magnitude[ratio] / Magnitude[dB]) "
                  "or the 'Writer_Version,2' header, which stores magnitude in dB."
         )
- 
+
     if not uploaded_files:
-        st.info("Please upload SIP file(s) to begin")
-        with st.expander("About this app"):
-            st.markdown("""
-            **Features:**
-            ### Intelligent Format Detection
-            - **O&E PSIP Format**: Full instrument output with metadata, multi-channel support
-            - **Simple Table Format**: Basic frequency/magnitude/phase data files
-            - Automatic detection - no manual format selection needed
-            
-            ### Interactive Visualization
-            - Multi-channel plotting with customizable axes
-            - Loop filtering and comparison
-            - SIP two-panel plot: phase over magnitude/conductivity on a shared log-frequency axis
-            - Logarithmic scaling options
-            - Hover tooltips for precise value inspection
-            
-            ### Robust Data Handling
-            - Handles files with multiple header sections
-            - European decimal format support (comma to dot conversion)
-            - Flexible separator detection (tabs, spaces)
-            - Empty column handling
-            - Automatic data type conversion
-            """)
+        render_about()
         return
- 
-    # ── Per-file sample geometry (comparison mode) ──
-    file_geometry = {}
-    if mode == "Compare Multiple Files":
-        with st.expander("📐 Per-file sample geometry", expanded=False):
-            st.caption("Set length and cross-section per file (e.g. files measured in different holders). "
-                       "Rows start from the global sample properties in the sidebar.")
-            file_geometry = get_per_file_geometry_ui(
-                [f.name for f in uploaded_files], sample_length, sample_area, sample_diameter
-            )
- 
-    # ── Process each uploaded file ──
-    processed_datasets = {}
-    dataset_geometry = {}
-    for uploaded_file in uploaded_files:
-        file_key = uploaded_file.name
-        sip_data, file_ref_resistor, format_name, detected_unit = parse_sip_file(uploaded_file)
-        if sip_data is None:
-            st.error(f"Failed to parse {file_key}")
-            continue
-        if magnitude_unit_choice == "Auto-detect":
-            magnitude_unit = detected_unit
-            unit_note = f"magnitude unit: {detected_unit} (detected)"
-        else:
-            magnitude_unit = magnitude_unit_choice
-            unit_note = f"magnitude unit: {magnitude_unit} (manual; detected {detected_unit})"
-        st.success(f"Loaded: **{file_key}** ({format_name}, {unit_note})")
-        reference_resistor = manual_ref if manual_ref > 0 else file_ref_resistor
-        geometry = file_geometry.get(file_key, global_geometry)
-        with st.spinner(f"Calculating properties for {file_key}..."):
+
+    tab_data, tab_spectra, tab_dd = st.tabs(["Data", "Spectra", "Debye decomposition"])
+
+    with tab_data:
+        summary_box = st.container()
+        # ── Per-file sample geometry (comparison mode) ──
+        file_geometry = {}
+        if mode == "Compare files":
+            with st.expander("Per-file sample geometry"):
+                st.caption("Set length and cross-section per file (e.g. files measured in different holders). "
+                           "Rows start from the sample properties in the sidebar.")
+                file_geometry = get_per_file_geometry_ui(
+                    [f.name for f in uploaded_files], sample_length, sample_area, sample_diameter
+                )
+
+        # ── Process each uploaded file ──
+        processed_datasets = {}
+        dataset_geometry = {}
+        summary_rows = []
+        for uploaded_file in uploaded_files:
+            file_key = uploaded_file.name
+            sip_data, file_ref_resistor, format_name, detected_unit = parse_sip_file(uploaded_file)
+            if sip_data is None:
+                st.error(f"Failed to parse {file_key}")
+                continue
+            if magnitude_unit_choice == "Auto-detect":
+                magnitude_unit, unit_note = detected_unit, f"{detected_unit} (detected)"
+            else:
+                magnitude_unit, unit_note = magnitude_unit_choice, f"{magnitude_unit_choice} (manual)"
+            reference_resistor = manual_ref if manual_ref > 0 else file_ref_resistor
+            geometry = file_geometry.get(file_key, global_geometry)
             sip_data = calculate_physics_properties(
                 sip_data, reference_resistor, geometry['length'], geometry['area'], magnitude_unit
             )
-        if 'Loop' in sip_data.columns:
-            sip_data['Loop'] = sip_data['Loop'].astype(str)
-        sip_data['Source_File'] = file_key
-        processed_datasets[file_key] = sip_data
-        dataset_geometry[file_key] = geometry
- 
-    if not processed_datasets:
-        st.error("No files were successfully processed")
-        return
- 
-    st.divider()
- 
-    if mode == "Single File":
-        file_key = list(processed_datasets.keys())[0]
-        sip_data = processed_datasets[file_key]
- 
-        col_info1, col_info2, col_info3 = st.columns(3)
-        with col_info1:
-            st.metric("Total Measurements", len(sip_data))
-        with col_info2:
             if 'Loop' in sip_data.columns:
-                st.metric("Measurement Loops", len(sip_data['Loop'].unique()))
-            else:
-                st.metric("Measurement Loops", "N/A")
-        with col_info3:
-            channels = [col.split()[0] for col in sip_data.columns if 'Magnitude' in col]
-            st.metric("Channels", len(channels) if channels else 1)
- 
-        col1, col2 = st.columns([1, 3])
-        with col1:
-            st.subheader("Plot Settings")
-            all_cols = sip_data.columns.tolist()
-            plot_mode = st.radio(
-                "Plot Mode", ["Standard", "SIP two-panel"], key="single_file_plot_mode",
-                help="SIP two-panel: phase on top, magnitude/conductivity below, sharing the frequency axis"
-            )
-            two_panel = None
-            if plot_mode == "SIP two-panel":
-                two_panel = get_two_panel_settings_ui(all_cols, "single_file")
-            if two_panel is None:
-                default_x = next((i for i, col in enumerate(all_cols) if 'frequency' in col.lower()), 0)
-                default_y = max(0, len(all_cols) - 1)
-                x_axis = st.selectbox("X-Axis", options=all_cols, index=default_x)
-                y_axis = st.selectbox("Y-Axis", options=all_cols, index=default_y)
-                st.markdown("---")
-                st.markdown("**Customize Labels:**")
-                default_title = f"{y_axis} vs {x_axis}"
-                custom_title = st.text_input("Plot Title", value=default_title)
-                custom_x_label = st.text_input("X-Axis Label", value=x_axis)
-                custom_y_label = st.text_input("Y-Axis Label", value=y_axis)
-            st.markdown("---")
-            if 'Loop' in sip_data.columns:
-                all_loops = sip_data['Loop'].unique()
-                # Filter out "Loop" string and empty values to show only loop identifiers
-                valid_loops = [
-                    loop for loop in all_loops 
-                    if str(loop).strip() and str(loop).strip().lower() != 'loop'
-                ]
-                
-                if valid_loops:
-                    selected_loops = st.multiselect(
-                        "Select Loops", 
-                        valid_loops, 
-                        default=valid_loops,
-                        help="Choose which measurement loops to display"
-                    )
-                    plot_data = sip_data[sip_data['Loop'].isin(selected_loops)] if selected_loops else sip_data
-                else:
-                    # No valid loop identifiers found, use all data
-                    plot_data = sip_data
-                    st.info("No loop identifiers found. Displaying all measurement data.")
-            else:
-                plot_data = sip_data
-            log_x = st.checkbox("Log Scale X-Axis", value=True)
-            log_y = st.checkbox("Log Scale Bottom Panel" if two_panel else "Log Scale Y-Axis", value=False)
-            
-            # Get research-level plot customization
-            style_config, use_colorblind, font_config, legend_config = get_research_customization_ui("single_file")
-        
-        # Fluid calibration check applies when phase is plotted against frequency
-        if two_panel:
-            phase_channel, freq_col = two_panel['channel'], two_panel['freq_col']
-        elif y_axis.endswith(PHASE_QUANTITY) and x_axis == find_frequency_column(all_cols):
-            phase_channel, freq_col = y_axis[:-len(PHASE_QUANTITY)].strip(), x_axis
+                sip_data['Loop'] = sip_data['Loop'].astype(str)
+            sip_data['Source_File'] = file_key
+            processed_datasets[file_key] = sip_data
+            dataset_geometry[file_key] = geometry
+            summary_rows.append({
+                "File": file_key,
+                "Format": format_name,
+                "Magnitude": unit_note,
+                "R_ref (Ω)": reference_resistor,
+                "Rows": len(sip_data),
+                "Loops": sip_data['Loop'].nunique() if 'Loop' in sip_data.columns else 1,
+                "Channels": len(get_phase_channels(sip_data.columns.tolist())) or 1,
+                "L (m)": geometry['length'],
+                "A (m²)": geometry['area'],
+            })
+
+        if not processed_datasets:
+            st.error("No files were successfully processed")
+            return
+
+        with summary_box:
+            st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True,
+                         column_config=number_column_config(["R_ref (Ω)", "L (m)", "A (m²)"]))
+
+        if mode == "Single file":
+            analysed = active_file if active_file in processed_datasets else next(iter(processed_datasets))
+            analysis_datasets = {analysed: processed_datasets[analysed]}
         else:
-            phase_channel, freq_col = None, find_frequency_column(all_cols)
-        fluid = get_fluid_calibration_ui(
-            phase_channel,
-            measured_low_frequency_conductivity(plot_data, phase_channel, freq_col) if phase_channel else np.nan,
-            f"single_{file_key}_{phase_channel}"
-        )
- 
-        with col2:
-            if plot_data.empty:
-                st.warning("No data selected.")
-                return
-            
-            # Create initial figure
-            if two_panel:
-                fig = create_sip_two_panel_plot(
-                    {file_key: plot_data}, two_panel['channel'], two_panel['bottom_quantity'],
-                    two_panel['freq_col'], log_x=log_x, log_y_bottom=log_y,
-                    title=two_panel['title'], x_label=two_panel['x_label'],
-                    top_label=two_panel['top_label'], bottom_label=two_panel['bottom_label']
-                )
-            else:
-                fig = px.line(
-                    plot_data, x=x_axis, y=y_axis,
-                    color='Loop' if 'Loop' in plot_data.columns else None,
-                    markers=True, title=custom_title, log_x=log_x, log_y=log_y
-                )
-            
-            # Get trace names for line color customization (two-panel traces share names)
-            trace_names = list(dict.fromkeys(trace.name for trace in fig.data))
-            
-            # Show line color pickers in sidebar (inside col1)
-            with col1:
-                st.markdown("---")
-                if use_colorblind:
-                    colorblind_palette = get_colorblind_safe_palette()
-                    line_colors = {}
-                    for idx, trace_name in enumerate(trace_names):
-                        line_colors[trace_name] = colorblind_palette[idx % len(colorblind_palette)]
-                    st.success(f"✅ Applied colorblind-safe palette to {len(trace_names)} traces")
-                else:
-                    line_colors = get_line_color_customization(trace_names, "single_file")
-            
-            # Apply customizations
-            if not two_panel:
-                fig.update_layout(
-                    height=600, hovermode='closest',
-                    title=dict(x=0.5, xanchor='center', font=dict(size=16)),
-                    xaxis_title=custom_x_label,
-                    yaxis_title=custom_y_label
-                )
-            
-            # Apply style customizations with fonts and legend
-            fig = apply_style_to_figure(fig, style_config, line_colors, font_config, legend_config)
-            if fluid:
-                add_fluid_phase_overlay(
-                    fig, plot_data[freq_col].min(), plot_data[freq_col].max(),
-                    fluid['sigma'], fluid['eps_r'], fluid['tolerance'], rows=[1] if two_panel else None
-                )
-            
-            st.plotly_chart(fig, use_container_width=True, config=get_plot_config(), theme=None)
-            if fluid:
-                show_fluid_deviation_table({file_key: plot_data}, freq_col, fluid)
-            
-            # Add export UI in sidebar
-            with col1:
-                get_export_ui(fig, "single_file")
- 
-        render_debye_decomposition_section({file_key: sip_data}, "single_file")
- 
-        with st.expander("View Processed Data Table"):
-            st.dataframe(sip_data, use_container_width=True)
-        st.download_button(
-            label="Download CSV",
-            data=with_geometry_columns(sip_data, dataset_geometry[file_key]).to_csv(index=False).encode('utf-8'),
-            file_name=f"sip_processed_{file_key}",
+            analysis_datasets = processed_datasets
+
+        st.subheader("Processed data")
+        preview = st.selectbox("File", options=list(analysis_datasets)) if len(analysis_datasets) > 1 \
+            else next(iter(analysis_datasets))
+        st.dataframe(analysis_datasets[preview], use_container_width=True, height=320)
+        download_cols = st.columns(2)
+        download_cols[0].download_button(
+            label=f"Download {preview} (CSV)",
+            data=with_geometry_columns(processed_datasets[preview], dataset_geometry[preview])
+                .to_csv(index=False).encode('utf-8'),
+            file_name=f"sip_processed_{preview}",
             mime="text/csv"
         )
-    else:
-        # ── Multi-file comparison mode ──
-        st.subheader(f"Comparing {len(processed_datasets)} files")
-        summary_data = []
-        for name, df in processed_datasets.items():
-            channels = [col.split()[0] for col in df.columns if 'Magnitude' in col]
-            summary_data.append({
-                "File": name, "Rows": len(df),
-                "Channels": len(channels) if channels else 1,
-                "Loops": len(df['Loop'].unique()) if 'Loop' in df.columns else 1,
-                "Length (m)": dataset_geometry[name]['length'],
-                "Area (m²)": dataset_geometry[name]['area']
-            })
-        st.dataframe(pd.DataFrame(summary_data), use_container_width=True)
-        st.divider()
- 
-        col1, col2 = st.columns([1, 3])
-        with col1:
-            st.subheader("Comparison Settings")
-            common_cols = set(processed_datasets[list(processed_datasets.keys())[0]].columns)
-            for df in processed_datasets.values():
-                common_cols = common_cols.intersection(set(df.columns))
-            common_cols = sorted(list(common_cols))
-            if not common_cols:
-                st.error("No common columns found across all files")
-                return
-            plot_mode = st.radio(
-                "Plot Mode", ["Standard", "SIP two-panel"], key="comparison_plot_mode",
-                help="SIP two-panel: phase on top, magnitude/conductivity below, sharing the frequency axis"
-            )
-            two_panel = None
-            if plot_mode == "SIP two-panel":
-                two_panel = get_two_panel_settings_ui(common_cols, "comparison")
-            if two_panel is None:
-                default_x = next((i for i, col in enumerate(common_cols) if 'frequency' in col.lower()), 0)
-                x_axis = st.selectbox("X-Axis", options=common_cols, index=default_x)
-                numeric_common_cols = [
-                    col for col in common_cols
-                    if pd.api.types.is_numeric_dtype(
-                        processed_datasets[list(processed_datasets.keys())[0]].get(col, pd.Series(dtype=float))
-                    )
-                ]
-                if not numeric_common_cols:
-                    st.error("No common numeric columns for Y-axis")
-                    return
-                y_axis = st.selectbox("Y-Axis", options=numeric_common_cols)
-                st.markdown("---")
-                st.markdown("**Customize Labels:**")
-                custom_title = st.text_input("Plot Title", value=f"{y_axis} vs {x_axis} - Comparison")
-                custom_x_label = st.text_input("X-Axis Label", value=x_axis)
-                custom_y_label = st.text_input("Y-Axis Label", value=y_axis)
-                st.markdown("---")
-                plot_type = st.radio(
-                    "Plot Type", ["overlay", "subplots"],
-                    format_func=lambda x: "Overlay (Single Plot)" if x == "overlay" else "Subplots (Separate Plots)"
-                )
-            else:
-                st.markdown("---")
-            log_x = st.checkbox("Log Scale X-Axis", value=True)
-            log_y = st.checkbox("Log Scale Bottom Panel" if two_panel else "Log Scale Y-Axis", value=False)
-            st.markdown("---")
-            st.markdown("**Files to Compare:**")
-            selected_files = {
-                name: processed_datasets[name]
-                for name in processed_datasets
-                if st.checkbox(name, value=True, key=f"select_{name}")
-            }
-            st.markdown("---")
-            st.markdown("**Loop Filtering:**")
-            has_loops = any('Loop' in df.columns for df in selected_files.values())
-            if has_loops:
-                selected_loops = {}
-                for name, df in selected_files.items():
-                    if 'Loop' in df.columns:
-                        loops = sorted(df['Loop'].unique())
-                        with st.expander(f"Loops for {name}"):
-                            col_a, col_b = st.columns(2)
-                            with col_a:
-                                if st.button("Select All", key=f"all_{name}"):
-                                    st.session_state[f"loops_{name}"] = loops
-                            with col_b:
-                                if st.button("Select None", key=f"none_{name}"):
-                                    st.session_state[f"loops_{name}"] = []
-                            if f"loops_{name}" not in st.session_state:
-                                st.session_state[f"loops_{name}"] = loops
-                            selected_loops[name] = st.multiselect(
-                                "Select loops", options=loops,
-                                default=st.session_state[f"loops_{name}"],
-                                key=f"loop_select_{name}"
-                            )
-                    else:
-                        selected_loops[name] = None
-            else:
-                selected_loops = None
-                st.info("No loop data available in selected files")
-            
-            # Get research-level plot customization
-            st.markdown("---")
-            style_config, use_colorblind, font_config, legend_config = get_research_customization_ui("comparison")
-        
-        # Fluid calibration check applies when phase is plotted against frequency
-        if two_panel:
-            phase_channel, freq_col = two_panel['channel'], two_panel['freq_col']
-        elif y_axis.endswith(PHASE_QUANTITY) and x_axis == find_frequency_column(common_cols):
-            phase_channel, freq_col = y_axis[:-len(PHASE_QUANTITY)].strip(), x_axis
-        else:
-            phase_channel, freq_col = None, find_frequency_column(common_cols)
-        first_file = next(iter(selected_files), None)
-        fluid = get_fluid_calibration_ui(
-            phase_channel,
-            measured_low_frequency_conductivity(selected_files[first_file], phase_channel, freq_col)
-            if phase_channel and first_file else np.nan,
-            f"comparison_{first_file}_{phase_channel}"
-        )
- 
-        with col2:
-            if not selected_files:
-                st.warning("Please select at least one file to plot")
-                return
-            
-            # Create initial figure
-            if two_panel:
-                fig = create_sip_two_panel_plot(
-                    selected_files, two_panel['channel'], two_panel['bottom_quantity'],
-                    two_panel['freq_col'], log_x=log_x, log_y_bottom=log_y,
-                    selected_loops=selected_loops,
-                    title=two_panel['title'], x_label=two_panel['x_label'],
-                    top_label=two_panel['top_label'], bottom_label=two_panel['bottom_label']
-                )
-            else:
-                fig = create_comparison_plot(
-                    selected_files, x_axis, y_axis,
-                    log_x=log_x, log_y=log_y, plot_type=plot_type,
-                    selected_loops=selected_loops,
-                    custom_title=custom_title,
-                    custom_x_label=custom_x_label,
-                    custom_y_label=custom_y_label
-                )
-            
-            # Get trace names for line color customization (two-panel traces share names)
-            trace_names = list(dict.fromkeys(trace.name for trace in fig.data))
-            
-            # Show line color pickers in sidebar (inside col1)
-            with col1:
-                st.markdown("---")
-                if use_colorblind:
-                    colorblind_palette = get_colorblind_safe_palette()
-                    line_colors = {}
-                    for idx, trace_name in enumerate(trace_names):
-                        line_colors[trace_name] = colorblind_palette[idx % len(colorblind_palette)]
-                    st.success(f"✅ Applied colorblind-safe palette to {len(trace_names)} traces")
-                else:
-                    line_colors = get_line_color_customization(trace_names, "comparison")
-            
-            # Apply style customizations with fonts and legend
-            fig = apply_style_to_figure(fig, style_config, line_colors, font_config, legend_config)
-            if fluid:
-                all_freqs = pd.concat([df[freq_col] for df in selected_files.values()])
-                if two_panel:
-                    fluid_rows = [1]
-                elif plot_type == 'subplots':
-                    fluid_rows = list(range(1, len(selected_files) + 1))
-                else:
-                    fluid_rows = None
-                add_fluid_phase_overlay(
-                    fig, all_freqs.min(), all_freqs.max(),
-                    fluid['sigma'], fluid['eps_r'], fluid['tolerance'], rows=fluid_rows
-                )
-            
-            st.plotly_chart(fig, use_container_width=True, config=get_plot_config())
-            if fluid:
-                show_fluid_deviation_table(selected_files, freq_col, fluid, selected_loops)
-            
-            # Add export UI in sidebar
-            with col1:
-                get_export_ui(fig, "comparison")
- 
-        render_debye_decomposition_section(selected_files, "comparison")
- 
-        st.divider()
-        st.subheader("Export Comparison Data")
-        if st.button("Combine All Data into Single CSV"):
+        if len(analysis_datasets) > 1:
             combined_df = pd.concat(
-                [with_geometry_columns(df, dataset_geometry[name]) for name, df in processed_datasets.items()],
+                [with_geometry_columns(df, dataset_geometry[name]) for name, df in analysis_datasets.items()],
                 ignore_index=True
             )
-            st.download_button(
-                label="Download Combined CSV",
+            download_cols[1].download_button(
+                label=f"Download all {len(analysis_datasets)} files combined (CSV)",
                 data=combined_df.to_csv(index=False).encode('utf-8'),
                 file_name="sip_comparison_combined.csv",
                 mime="text/csv"
             )
-            st.success(f"Combined {len(processed_datasets)} files into one CSV with {len(combined_df)} total rows")
+
+    with tab_spectra:
+        render_spectra_tab(analysis_datasets, "single_file" if mode == "Single file" else "comparison")
+
+    with tab_dd:
+        render_debye_decomposition_section(analysis_datasets, "single_file" if mode == "Single file" else "comparison")
+
 
 if __name__ == "__main__":
     main()
